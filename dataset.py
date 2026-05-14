@@ -9,7 +9,7 @@ import pylidc as pl
 from config import (
     SAMPLE_SIZE, IMG_SIZE, HU_MIN, HU_MAX,
     LUNG_HU_THRESHOLD, MASK_DILATION, SEED,
-    RESULTS_DIR,
+    RESULTS_DIR, CACHE_PATH, MIN_RADIOLOGISTS, MALIGNANCY_THRESHOLD,
 )
 
 
@@ -82,7 +82,7 @@ def _mask_to_tensor(mask_2d, size=IMG_SIZE):
 
 def load_nodules(sample_size=SAMPLE_SIZE, seed=SEED):
     """Load up to sample_size nodules from LIDC-IDRI via pylidc, or from cache."""
-    cache_path = os.path.join(RESULTS_DIR, "cache.pkl")
+    cache_path = CACHE_PATH
     if os.path.exists(cache_path):
         print("Loading from cache...")
         with open(cache_path, "rb") as f:
@@ -120,13 +120,13 @@ def load_nodules(sample_size=SAMPLE_SIZE, seed=SEED):
         for ann_group in nods:
             if len(nodules) >= sample_size:
                 break
-            if len(ann_group) < 2:
+            if len(ann_group) < MIN_RADIOLOGISTS:
                 continue
 
             mean_score = np.mean([a.malignancy for a in ann_group])
-            if mean_score == 3.0:
+            if mean_score == MALIGNANCY_THRESHOLD:
                 continue  # skip ambiguous
-            label_val = 1 if mean_score > 3.0 else 0
+            label_val = 1 if mean_score > MALIGNANCY_THRESHOLD else 0
 
             ann = ann_group[0]
             bbox = ann.bbox()

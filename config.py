@@ -10,4 +10,7 @@ HU_MAX = 400
 LUNG_HU_THRESHOLD = -500
 MASK_DILATION = 3
 RESULTS_DIR = "results"
+CACHE_PATH = "results/cache.pkl"
+MIN_RADIOLOGISTS = 2
+MALIGNANCY_THRESHOLD = 3
 # Split ratios: 70/15/15 train/val/test — enforced in dataset.patient_split()

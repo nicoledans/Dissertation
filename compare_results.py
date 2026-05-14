@@ -1,7 +1,7 @@
 import os
 import re
 
-RESULTS_DIR = "results"
+from config import RESULTS_DIR
 BASELINE_LOG = os.path.join(RESULTS_DIR, "baseline_log.txt")
 TRAIN_LOG    = os.path.join(RESULTS_DIR, "train_log.txt")
 TRAIN_TS_LOG = os.path.join(RESULTS_DIR, "train_ts_log.txt")

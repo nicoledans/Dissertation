@@ -7,7 +7,14 @@ import pylidc as pl
 from scipy.ndimage import (
     label, binary_fill_holes, binary_dilation, binary_opening, zoom
 ) #Used for image processing functions
-from config import SAMPLE_SIZE as _CFG_SAMPLE_SIZE
+from config import (
+    SAMPLE_SIZE as _CFG_SAMPLE_SIZE,
+    LUNG_HU_THRESHOLD as _CFG_LUNG_HU_THRESHOLD,
+    MASK_DILATION as _CFG_MASK_DILATION,
+    CACHE_PATH as _CFG_CACHE_PATH,
+    MIN_RADIOLOGISTS as _CFG_MIN_RADIOLOGISTS,
+    MALIGNANCY_THRESHOLD as _CFG_MALIGNANCY_THRESHOLD,
+)
 
 # TotalSegmentator (used in oracle-ct also)
 TS_AVAILABLE = False
@@ -19,20 +26,13 @@ try:
 except ImportError:
     pass
 
-# Hardcoded settings 
-# HU values below threshold are "air-like" (lung interior / outside air)
-LUNG_HU_THRESHOLD = -500 
-# Grow mask by 3 pixels
-MASK_DILATION = 3
-# radiologists rate 1–5, threshold at 3
-    # if avg_mal 3 - skipped not added to cache
-    # if avg_mal > 3 - malignant; <3 benign
-MALIGNANCY_THRESHOLD = 3
-# At least 2 radiologist must have annotated the module
-MIN_RADIOLOGISTS = 2
-# How many to cache — single source of truth is config.py
+# All constants from config.py — single source of truth
+LUNG_HU_THRESHOLD = _CFG_LUNG_HU_THRESHOLD
+MASK_DILATION = _CFG_MASK_DILATION
+MALIGNANCY_THRESHOLD = _CFG_MALIGNANCY_THRESHOLD
+MIN_RADIOLOGISTS = _CFG_MIN_RADIOLOGISTS
 SAMPLE_SIZE = _CFG_SAMPLE_SIZE
-CACHE_PATH = "results/cache.pkl"
+CACHE_PATH = _CFG_CACHE_PATH
 
 # Physics-based lung foreground mask
     # Uses HU thresholding as a Grad-CAM
