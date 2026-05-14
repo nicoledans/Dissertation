@@ -1,0 +1,2 @@
+To run tomorrow: activate lidc_env, then python train.py and python baseline.py. 
+Compare Val AUC in results/train_log.txt vs results/baseline_log.txt to quantify the HU mask contribution.

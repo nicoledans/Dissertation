@@ -1,0 +1,36 @@
+# Claude Code — settings, session files, instruction docs
+.claude/
+CLAUDE.md
+claude_docs/
+*.md
+intructions.txt
+
+# Model weights and results
+results/
+*.pt
+*.pth
+
+# Cache
+*.pkl
+
+# Virtual environment
+lidc_env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data — never commit medical data
+*.dcm
+*.mhd
+*.raw
+*.nii
+*.nii.gz
