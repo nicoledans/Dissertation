@@ -10,5 +10,4 @@ HU_MAX = 400
 LUNG_HU_THRESHOLD = -500
 MASK_DILATION = 3
 RESULTS_DIR = "results"
-TRAIN_SPLIT = 0.80
-VAL_SPLIT = 0.20
+# Split ratios: 70/15/15 train/val/test — enforced in dataset.patient_split()

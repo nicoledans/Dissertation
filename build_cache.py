@@ -7,6 +7,7 @@ import pylidc as pl
 from scipy.ndimage import (
     label, binary_fill_holes, binary_dilation, binary_opening, zoom
 ) #Used for image processing functions
+from config import SAMPLE_SIZE as _CFG_SAMPLE_SIZE
 
 # TotalSegmentator (used in oracle-ct also)
 TS_AVAILABLE = False
@@ -29,8 +30,8 @@ MASK_DILATION = 3
 MALIGNANCY_THRESHOLD = 3
 # At least 2 radiologist must have annotated the module
 MIN_RADIOLOGISTS = 2
-# How many to cache
-SAMPLE_SIZE = 2000
+# How many to cache — single source of truth is config.py
+SAMPLE_SIZE = _CFG_SAMPLE_SIZE
 CACHE_PATH = "results/cache.pkl"
 
 # Physics-based lung foreground mask

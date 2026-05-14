@@ -9,7 +9,7 @@ import pylidc as pl
 from config import (
     SAMPLE_SIZE, IMG_SIZE, HU_MIN, HU_MAX,
     LUNG_HU_THRESHOLD, MASK_DILATION, SEED,
-    TRAIN_SPLIT, VAL_SPLIT, RESULTS_DIR,
+    RESULTS_DIR,
 )
 
 
