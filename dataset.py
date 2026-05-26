@@ -80,9 +80,9 @@ def _mask_to_tensor(mask_2d, size=IMG_SIZE):
     return (m > 0.5).float()
 
 
-def load_nodules(sample_size=SAMPLE_SIZE, seed=SEED):
+def load_nodules(sample_size=SAMPLE_SIZE, seed=SEED, cache_path=None):
     """Load up to sample_size nodules from LIDC-IDRI via pylidc, or from cache."""
-    cache_path = CACHE_PATH
+    cache_path = cache_path or CACHE_PATH
     if os.path.exists(cache_path):
         print("Loading from cache...")
         with open(cache_path, "rb") as f:
@@ -167,7 +167,10 @@ def load_nodules(sample_size=SAMPLE_SIZE, seed=SEED):
 def patient_split(nodules, seed=SEED):
     """Patient-level 70/15/15 train/val/test split."""
     rng = np.random.default_rng(seed)
-    patients = list({n["patient_id"] for n in nodules})
+    # sorted() before shuffle so the pre-shuffle order is deterministic across runs
+    # (set iteration order is random in Python, which would make rng.shuffle produce
+    # different splits even with the same seed)
+    patients = sorted({n["patient_id"] for n in nodules})
     rng.shuffle(patients)
 
     n = len(patients)

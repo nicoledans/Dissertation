@@ -2,6 +2,7 @@ import os
 import pickle
 import tempfile
 import shutil
+import argparse
 import numpy as np
 import pylidc as pl
 from scipy.ndimage import (
@@ -31,8 +32,9 @@ LUNG_HU_THRESHOLD = _CFG_LUNG_HU_THRESHOLD
 MASK_DILATION = _CFG_MASK_DILATION
 MALIGNANCY_THRESHOLD = _CFG_MALIGNANCY_THRESHOLD
 MIN_RADIOLOGISTS = _CFG_MIN_RADIOLOGISTS
-SAMPLE_SIZE = _CFG_SAMPLE_SIZE
 CACHE_PATH = _CFG_CACHE_PATH
+
+CHECKPOINT_PATH = "results/cache_checkpoint.pkl"
 
 # Physics-based lung foreground mask
     # Uses HU thresholding as a Grad-CAM
@@ -101,10 +103,10 @@ _TS_LUNG_LABELS = [
 ]
 
 # Total Segmentartor Mask
-def _get_ts_vol_mask(vol, patient_id):
+def _get_ts_vol_mask(vol, patient_id, device):
     if not TS_AVAILABLE:
         return None
-    
+
     # Makes temp folder as needs NIfTI format
     tmpdir = tempfile.mkdtemp(prefix=f"ts_{patient_id}_")
     try:
@@ -116,8 +118,14 @@ def _get_ts_vol_mask(vol, patient_id):
         nib.save(nib_img, nifti_in)
 
         # Run TotalSegmentator on the saved NIfTI. Writes one mask file per organ
-        device = "gpu" if _torch.cuda.is_available() else "cpu"
-        _run_ts(nifti_in, nifti_out, task="total", device=device, quiet=True)
+        _run_ts(
+            nifti_in, nifti_out, task="total", device=device, fast=True, quiet=True,
+            roi_subset=[
+                "lung_upper_lobe_left", "lung_lower_lobe_left",
+                "lung_upper_lobe_right", "lung_middle_lobe_right",
+                "lung_lower_lobe_right",
+            ],
+        )
 
         combined = None
         for lname in _TS_LUNG_LABELS:
@@ -154,23 +162,97 @@ def _get_middle_slice_idx(ann):
     return k_indices[len(k_indices) // 2]
 
 
+def _save_checkpoint(samples, next_scan_idx, path):
+    with open(path, "wb") as f:
+        pickle.dump({"samples": samples, "next_scan_idx": next_scan_idx}, f)
+
+
+def _load_checkpoint(path):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--sample-size", type=int, default=_CFG_SAMPLE_SIZE,
+        help="Override SAMPLE_SIZE from config (e.g. 200 for a quick demo run)"
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Ignore any existing checkpoint and start from scratch"
+    )
+    parser.add_argument(
+        "--no-ts", action="store_true",
+        help="Skip TotalSegmentator — cache HU masks only (faster, for Exp 1)"
+    )
+    parser.add_argument(
+        "--cache-path", type=str, default=None,
+        help="Override cache output path (default: results/cache.pkl)"
+    )
+    args = parser.parse_args()
+    SAMPLE_SIZE = args.sample_size
+
+    cache_out = args.cache_path if args.cache_path else CACHE_PATH
+    checkpoint_out = cache_out.replace(".pkl", "_checkpoint.pkl")
+
     os.makedirs("results", exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(cache_out)), exist_ok=True)
+
+    # GPU status
+    if args.no_ts:
+        device = "cpu"
+        print("[NO-TS] Skipping TotalSegmentator — HU masks only (ts_mask=None for all samples).")
+    elif TS_AVAILABLE and _torch.cuda.is_available():
+        device = "gpu"
+        gpu_name = _torch.cuda.get_device_name(0)
+        print(f"[GPU] TotalSegmentator will use CUDA: {gpu_name}")
+    else:
+        device = "cpu"
+        if TS_AVAILABLE:
+            print("[CPU] No CUDA detected — TotalSegmentator running on CPU (slow). "
+                  "Install CUDA drivers + torch-cuda if you have a GPU.")
+        else:
+            print("[CPU] TotalSegmentator not available — TS masks will be None.")
+
+    print(f"[CACHE] Output → {cache_out}")
+
+    # Checkpoint resume
+    checkpoint = None if args.fresh else _load_checkpoint(checkpoint_out)
+    if checkpoint:
+        samples = checkpoint["samples"]
+        start_scan_idx = checkpoint["next_scan_idx"]
+        print(f"[RESUME] Loaded checkpoint: {len(samples)} samples already collected, "
+              f"resuming from scan index {start_scan_idx}")
+    else:
+        samples = []
+        start_scan_idx = 0
+        if args.fresh and os.path.exists(checkpoint_out):
+            os.remove(checkpoint_out)
+            print("[FRESH] Deleted existing checkpoint, starting from scratch.")
+
     scans = pl.query(pl.Scan).all()
-    samples = [] #P ull every scan in the LIDC db as a list of pylidc Scan objects.
 
     for scan_idx, scan in enumerate(scans):
+        if scan_idx < start_scan_idx:
+            continue
+
         if len(samples) >= SAMPLE_SIZE:
             break
 
-        print(f"Scan {scan_idx:04d} | patient {scan.patient_id} | cached so far: {len(samples)}")
+        print(f"Scan {scan_idx:04d} | patient {scan.patient_id} | cached so far: {len(samples)}/{SAMPLE_SIZE}")
 
         try:
             vol = scan.to_volume()
             nod_groups = scan.cluster_annotations()
 
-            # TotalSegmentator mask- computed once per scan
-            ts_vol_mask = _get_ts_vol_mask(vol, scan.patient_id)
+            # TotalSegmentator mask — computed once per scan (None if --no-ts)
+            if args.no_ts:
+                ts_vol_mask = None
+            else:
+                ts_vol_mask = _get_ts_vol_mask(vol, scan.patient_id, device)
 
             for ann_group in nod_groups:
                 if len(samples) >= SAMPLE_SIZE:
@@ -229,16 +311,22 @@ def main():
 
         except Exception as e:
             print(f"  WARNING: skipped scan {scan.patient_id}: {e}")
-            continue
 
-    with open(CACHE_PATH, "wb") as f:
+        # Save checkpoint after every scan so a crash loses at most one scan's worth
+        _save_checkpoint(samples, scan_idx + 1, checkpoint_out)
+
+    with open(cache_out, "wb") as f:
         pickle.dump(samples, f)
+
+    # Keep checkpoint so a future run with a larger SAMPLE_SIZE can resume from here
+    # (use --fresh to discard it and start over)
 
     n_mal = sum(s["label"] for s in samples)
     n_ben = len(samples) - n_mal
-    print(f"\nDone. Cached {len(samples)} nodule slices to {CACHE_PATH}")
-    print(f"  {n_ben} benign, {n_mal} malignant")
-    print("Now run train.py and baseline.py — loading will be instant")
+    ts_count = sum(1 for s in samples if s.get("ts_mask") is not None)
+    print(f"\nDone. Cached {len(samples)} nodule slices to {cache_out}")
+    print(f"  {n_ben} benign, {n_mal} malignant | TS masks: {ts_count}/{len(samples)}")
+    print(f"Now run baseline.py / train.py — pass --cache-path {cache_out} if not using default")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-SAMPLE_SIZE = 600
+SAMPLE_SIZE = 2000
 EPOCHS = 20
 BATCH_SIZE = 16
 LR = 1e-4
@@ -13,4 +13,4 @@ RESULTS_DIR = "results"
 CACHE_PATH = "results/cache.pkl"
 MIN_RADIOLOGISTS = 2
 MALIGNANCY_THRESHOLD = 3
-# Split ratios: 70/15/15 train/val/test — enforced in dataset.patient_split()
+# Split ratios: 70/15/15 train/val/test

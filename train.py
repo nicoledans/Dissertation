@@ -1,4 +1,6 @@
 import os
+import argparse
+from datetime import datetime
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -16,16 +18,61 @@ from dataset import LIDCDataset, load_nodules, patient_split
 from model import NoduleClassifier
 
 
+def _gradcam_mask_stats(model, val_nods, device):
+    """Compute % of Grad-CAM activation energy inside lung mask over full val set."""
+    model.eval()
+    pct_list = []
+    ds = LIDCDataset(val_nods)
+    if len(ds) == 0:
+        return float("nan"), float("nan"), 0
+    loader = DataLoader(ds, batch_size=1, shuffle=False)
+    with torch.enable_grad():
+        for images, masks, _, _ in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            logits = model(images).squeeze(1)
+            logits.sum().backward()
+            cam = model.get_gradcam()
+            cam_up = F.interpolate(
+                cam.unsqueeze(1),
+                size=(masks.shape[2], masks.shape[3]),
+                mode="bilinear", align_corners=False,
+            ).squeeze(1)
+            mask_2d = masks.squeeze(1)
+            inside = (cam_up * mask_2d).sum().item()
+            total = cam_up.sum().item() + 1e-8
+            pct_list.append(inside / total * 100.0)
+            model.clear_hooks()
+    arr = np.array(pct_list)
+    return float(arr.mean()), float(arr.std()), len(arr)
+
+
 def train():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Shared run ID for grouping results (auto-timestamp if omitted)")
+    parser.add_argument("--cache-path", type=str, default=None,
+                        help="Path to cache.pkl (default: results/cache.pkl)")
+    args = parser.parse_args()
+
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(RESULTS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    with open(os.path.join(RESULTS_DIR, "latest_run.txt"), "w") as f:
+        f.write(run_id)
+
+    print(f"[RUN] {run_id}  →  {run_dir}")
+    print(f"      To compare after all scripts: python compare_all.py --run-id {run_id}")
+
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    nodules = load_nodules()
+    nodules = load_nodules(cache_path=args.cache_path)
     train_nods, val_nods, _ = patient_split(nodules)
 
     if not train_nods:
-        print("No training samples — cache too small or all from one patient. Run build_cache.py with SAMPLE_SIZE=100.")
+        print("No training samples — cache too small or all from one patient.")
         return
 
     train_ds = LIDCDataset(train_nods)
@@ -41,9 +88,9 @@ def train():
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    log_path = os.path.join(RESULTS_DIR, "train_log.txt")
+    log_path = os.path.join(run_dir, "train_log.txt")
     best_auc = 0.0
-    best_model_path = os.path.join(RESULTS_DIR, "best_model.pt")
+    best_model_path = os.path.join(run_dir, "best_model.pt")
 
     with open(log_path, "w") as log_f:
         for epoch in range(1, EPOCHS + 1):
@@ -55,18 +102,24 @@ def train():
 
                 optimizer.zero_grad()
 
-                # Forward pass
-                logits = model(images).squeeze(1)  # (B,)
-
-                # classification + lambda x explanation
+                logits = model(images).squeeze(1)  # forward pass stores activations
                 bce_loss = criterion(logits, labels)
 
-                bce_loss.backward(retain_graph=True)
-                cam = model.get_gradcam()  # (B, H_feat, W_feat)
+                # ── Differentiable attention penalty via layer4 activations ──────
+                # Using activations (not Grad-CAM gradients) keeps the penalty in
+                # the computation graph so it can actually train the model to focus
+                # inside the mask. Grad-CAM requires a backward pass first, which
+                # detaches the penalty from the graph and kills gradient signal.
+                acts = model._activations  # (B, C, H_feat, W_feat) from forward hook
+                attn = torch.relu(acts).mean(dim=1, keepdim=True)  # (B, 1, H, W)
+                b_size = attn.shape[0]
+                flat = attn.view(b_size, -1)
+                attn_min = flat.min(dim=1)[0].view(b_size, 1, 1, 1)
+                attn_max = flat.max(dim=1)[0].view(b_size, 1, 1, 1)
+                attn = (attn - attn_min) / (attn_max - attn_min + 1e-8)
 
-                # Resize heatmap to mask spatial dimensions
-                cam_resized = F.interpolate(
-                    cam.unsqueeze(1),
+                attn_resized = F.interpolate(
+                    attn,
                     size=(masks.shape[2], masks.shape[3]),
                     mode="bilinear",
                     align_corners=False,
@@ -74,18 +127,16 @@ def train():
 
                 mask_2d = masks.squeeze(1)  # (B, H, W)
 
-                # Penalise attention at irrelevant regions
-                penalty = (cam_resized * (1.0 - mask_2d)).sum(dim=(1, 2)) / (
-                    cam_resized.sum(dim=(1, 2)) + 1e-8
+                # Fraction of attention falling outside the lung mask
+                penalty = (attn_resized * (1.0 - mask_2d)).sum(dim=(1, 2)) / (
+                    attn_resized.sum(dim=(1, 2)) + 1e-8
                 )  # (B,)
 
-                # [ZHANG ET AL] ad-CSL adaptive scaling
-                scale = 2.0 * (torch.sigmoid(logits) - 0.5).abs()  # (B,)
+                # Confidence-adaptive scaling (detached so BCE grad isn't double-counted)
+                scale = 2.0 * (torch.sigmoid(logits.detach()) - 0.5).abs()  # (B,)
 
-                # classification + lambda x explanation
                 total_loss = bce_loss + ALPHA * (scale * penalty).mean()
 
-                optimizer.zero_grad()
                 total_loss.backward()
                 optimizer.step()
                 model.clear_hooks()
@@ -97,7 +148,6 @@ def train():
                     f"Total {total_loss.item():.4f}"
                 )
 
-            # Validation
             model.eval()
             all_preds, all_labels = [], []
             with torch.no_grad():
@@ -126,26 +176,44 @@ def train():
                 torch.save(model.state_dict(), best_model_path)
                 print(f"  -> Saved best model (AUC {best_auc:.4f})")
 
-    # Grad-CAM visualisation
-    # Layout: CT slice | lung mask | heatmap | overlay with mask boundary
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+
+    # ── Quantitative Grad-CAM mask alignment ─────────────────────────────────
+    print("\nComputing Grad-CAM mask alignment stats...")
+    mean_pct, std_pct, n_samples = _gradcam_mask_stats(model, val_nods, device)
+    stats_lines = [
+        "=== GRAD-CAM MASK ALIGNMENT (HU Mask constraint) ===",
+        f"Val samples evaluated: {n_samples}",
+        f"Mean % activation inside mask: {mean_pct:.1f}%",
+        f"Std:                           {std_pct:.1f}%",
+        "(Higher than baseline = attention penalty is working)",
+    ]
+    stats_text = "\n".join(stats_lines)
+    print(stats_text)
+    with open(os.path.join(run_dir, "gradcam_stats_train.txt"), "w") as f:
+        f.write(stats_text + "\n")
+
+    # ── Grad-CAM visualisation (4 examples) ──────────────────────────────────
     if not val_nods:
         print("No validation samples — skipping Grad-CAM visualisation")
-    else:
-        model.eval()
-        collected = 0
-        n_rows = min(4, len(val_nods))
-        fig, axes = plt.subplots(n_rows, 4, figsize=(16, 4 * n_rows))
-        if n_rows == 1:
-            axes = axes[np.newaxis, :]
+        return
 
-    for images, masks, labels, _ in DataLoader(LIDCDataset(val_nods) if val_nods else [], batch_size=1):
+    model.eval()
+    collected = 0
+    n_rows = min(4, len(val_nods))
+    fig, axes = plt.subplots(n_rows, 4, figsize=(16, 4 * n_rows))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    for images, masks, labels, _ in DataLoader(LIDCDataset(val_nods), batch_size=1):
         if collected >= 4:
             break
         images = images.to(device)
         masks = masks.to(device)
         logits = model(images).squeeze(1)
         logits.sum().backward()
-        cam = model.get_gradcam()  # (1, H_feat, W_feat)
+        cam = model.get_gradcam()
         cam_up = F.interpolate(
             cam.unsqueeze(1), size=(IMG_SIZE, IMG_SIZE),
             mode="bilinear", align_corners=False,
@@ -155,15 +223,15 @@ def train():
         mask_np = masks[0, 0].cpu().detach().numpy()
         label_val = labels[0].item()
 
-        row = collected
-        ax = axes[row]
+        inside = float((cam_up * (mask_np > 0.5)).sum() / (cam_up.sum() + 1e-8) * 100)
 
+        ax = axes[collected]
         ax[0].imshow(img_np, cmap="gray")
         ax[0].set_title(f"CT slice (label={int(label_val)})")
         ax[0].axis("off")
 
         ax[1].imshow(mask_np, cmap="gray")
-        ax[1].set_title("Lung mask")
+        ax[1].set_title("Lung mask (HU)")
         ax[1].axis("off")
 
         ax[2].imshow(cam_up, cmap="jet")
@@ -173,17 +241,16 @@ def train():
         ax[3].imshow(img_np, cmap="gray")
         ax[3].imshow(cam_up, cmap="jet", alpha=0.5)
         ax[3].contour(mask_np, levels=[0.5], colors="lime", linewidths=1)
-        ax[3].set_title("Overlay + mask boundary")
+        ax[3].set_title(f"Overlay (lime=mask) | {inside:.0f}% inside")
         ax[3].axis("off")
 
         model.clear_hooks()
         collected += 1
 
-    if val_nods:
-        plt.tight_layout()
-        fig.savefig(os.path.join(RESULTS_DIR, "gradcam_examples.png"), dpi=150)
-        plt.close(fig)
-        print(f"Saved Grad-CAM examples to {RESULTS_DIR}/gradcam_examples.png")
+    plt.tight_layout()
+    fig.savefig(os.path.join(run_dir, "gradcam_examples.png"), dpi=150)
+    plt.close(fig)
+    print(f"Saved Grad-CAM examples → {run_dir}/gradcam_examples.png")
 
 
 if __name__ == "__main__":
