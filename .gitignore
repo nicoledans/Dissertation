@@ -10,8 +10,9 @@ results/
 *.pt
 *.pth
 
-# Cache
-*.pkl
+# Cache directory — ignore pkl files but track the status file
+cache/*.pkl
+cache/*_checkpoint.pkl
 
 # Virtual environment
 lidc_env/

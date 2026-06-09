@@ -1,0 +1,7 @@
+Status:       COMPLETE
+Last cached:   2026-06-05 17:15:11
+Cache path:   cache/cache_hu_fixed.pkl
+Collected:    1575 / 2000 samples
+  Benign:     984
+  Malignant:  591
+  TS masks:   0/1575

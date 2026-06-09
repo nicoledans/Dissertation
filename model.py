@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -21,10 +20,9 @@ class NoduleClassifier(nn.Module):
         self._activations = None
         self._gradients = None
 
-        # Forward hook layer4 - store feature maps
-        self.backbone.layer4.register_forward_hook(self._save_activations)
-        # Backward hook layer4 -  store gradients
-        self.backbone.layer4.register_full_backward_hook(self._save_gradients)
+        # Keep layer-4 feature maps and gradients for Grad-CAM evaluation.
+        self._forward_hook = self.backbone.layer4.register_forward_hook(self._save_activations)
+        self._backward_hook = self.backbone.layer4.register_full_backward_hook(self._save_gradients)
 
     def _save_activations(self, module, input, output):
         self._activations = output
@@ -35,24 +33,69 @@ class NoduleClassifier(nn.Module):
     def forward(self, x):
         return self.backbone(x)
 
-    def get_gradcam(self):
-        grads = self._gradients          # (B, C, H, W)
-        acts = self._activations         # (B, C, H, W)
+    @staticmethod
+    def class_scores(logits, labels=None):
+        """Return the score for the relevant binary class.
 
-        # Global average pool gradients to get per-channel weights
-        weights = grads.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
-        cam = (weights * acts).sum(dim=1)               # (B, H, W)
-        cam = torch.relu(cam)
+        With labels, target the ground-truth class for explanation-supervised
+        training. Without labels, target the model's predicted class for
+        post-hoc explanation.
+        """
+        if labels is None:
+            signs = torch.where(logits.detach() >= 0, 1.0, -1.0)
+        else:
+            signs = labels.to(dtype=logits.dtype) * 2.0 - 1.0
+        return logits * signs
 
-        # Normalise each map in [0, 1]
+    @property
+    def activations(self):
+        if self._activations is None:
+            raise RuntimeError("No activations available. Run a forward pass first.")
+        return self._activations
+
+    @staticmethod
+    def normalise_gradcam(cam):
+        """Normalise each CAM independently to [0, 1]."""
         b = cam.shape[0]
-        cam_flat = cam.view(b, -1)
-        cam_min = cam_flat.min(dim=1)[0].view(b, 1, 1)
-        cam_max = cam_flat.max(dim=1)[0].view(b, 1, 1)
-        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+        cam_flat = cam.flatten(start_dim=1)
+        cam_min = cam_flat.min(dim=1).values.view(b, 1, 1)
+        cam_max = cam_flat.max(dim=1).values.view(b, 1, 1)
+        return (cam - cam_min) / (cam_max - cam_min + 1e-8)
 
-        return cam  # (B, H, W) tensor, values in [0,1]
+    def get_gradcam(self, normalise=True):
+        """Return post-hoc Grad-CAM after backward() has populated gradients."""
+        if self._gradients is None:
+            raise RuntimeError("No gradients available. Run backward() before get_gradcam().")
+        grads = self._gradients
+        acts = self.activations
+
+        weights = grads.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * acts).sum(dim=1))
+        return self.normalise_gradcam(cam) if normalise else cam
+
+    def differentiable_gradcam(self, scores, normalise=True):
+        """Return class-specific Grad-CAM while retaining gradients for training.
+
+        This requires second-order gradients and is therefore more expensive
+        than ordinary classification training.
+        """
+        acts = self.activations
+        grads = torch.autograd.grad(
+            outputs=scores.sum(),
+            inputs=acts,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+        weights = grads.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * acts).sum(dim=1))
+        return self.normalise_gradcam(cam) if normalise else cam
 
     def clear_hooks(self):
+        """Clear stored hook tensors without removing the registered hooks."""
         self._activations = None
         self._gradients = None
+
+    def remove_hooks(self):
+        """Remove registered hooks when the model is no longer needed."""
+        self._forward_hook.remove()
+        self._backward_hook.remove()
