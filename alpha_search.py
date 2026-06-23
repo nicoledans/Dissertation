@@ -246,34 +246,7 @@ def _train_alpha(alpha, train_nods, val_nods, device, epochs, batch_size, trial_
     }
 
 
-def _select_alpha(results, auc_tolerance):
-    reference = next(result for result in results if result["alpha"] == 0.0)
-    if not np.isfinite(reference["val_auc"]):
-        raise RuntimeError("alpha=0 produced no finite validation AUC; selection is impossible.")
-    threshold = reference["val_auc"] - auc_tolerance
-    eligible = [
-        result for result in results
-        if (
-            np.isfinite(result["val_auc"])
-            and result["val_auc"] >= threshold
-            and np.isfinite(result["val_normalized_alignment"])
-        )
-    ]
-    if not eligible:
-        raise RuntimeError("No alpha has both an eligible AUC and finite normalized alignment.")
-    selected = max(
-        eligible,
-        key=lambda result: (
-            result["val_normalized_alignment"],
-            result["val_auc"],
-            -result["alpha"],
-        ),
-    )
-    return reference, threshold, selected
-
-
-def _write_results(results, run_dir, auc_tolerance):
-    reference, threshold, selected = _select_alpha(results, auc_tolerance)
+def _write_results(results, run_dir):
     csv_path = os.path.join(run_dir, "alpha_sensitivity.csv")
     fields = [key for key in results[0] if key != "checkpoint"]
     with open(csv_path, "w", newline="") as file:
@@ -283,34 +256,24 @@ def _write_results(results, run_dir, auc_tolerance):
             writer.writerow({key: result[key] for key in fields})
 
     lines = [
-        "=== ALPHA SENSITIVITY AND SELECTION ===",
-        "Selection rule: maximize validation normalized alignment among alphas",
-        f"whose validation AUC is within {auc_tolerance:.4f} of alpha=0.",
-        f"Alpha=0 validation AUC: {reference['val_auc']:.4f}",
-        f"Eligibility threshold: {threshold:.4f}",
+        "=== ALPHA SENSITIVITY ===",
+        "No automatic alpha selection is applied.",
+        "Use this table/plot to decide the AUC-vs-attention trade-off manually.",
         "",
-        "alpha | val_auc | alignment | norm_align | blank_rate | eligible",
+        "alpha | val_auc | val_acc | alignment | norm_align | blank_rate",
     ]
     for result in results:
-        eligible = (
-            np.isfinite(result["val_auc"])
-            and result["val_auc"] >= threshold
-            and np.isfinite(result["val_normalized_alignment"])
-        )
         lines.append(
-            f"{result['alpha']:>5.2f} | {result['val_auc']:.4f} | "
+            f"{result['alpha']:>5.3f} | {result['val_auc']:.4f} | "
+            f"{result['val_accuracy']:.4f} | "
             f"{result['val_alignment'] * 100:>8.2f}% | "
             f"{result['val_normalized_alignment']:>10.3f} | "
-            f"{result['val_blank_rate'] * 100:>9.2f}% | {eligible}"
+            f"{result['val_blank_rate'] * 100:>9.2f}%"
         )
     lines.extend([
         "",
-        f"SELECTED ALPHA: {selected['alpha']:.4f}",
-        f"Selected validation AUC: {selected['val_auc']:.4f}",
-        f"Selected validation alignment: {selected['val_alignment'] * 100:.2f}%",
-        f"Selected normalized alignment: {selected['val_normalized_alignment']:.3f}",
-        "",
-        "The held-out test set was not evaluated during alpha selection.",
+        "The held-out test set was not evaluated in this sensitivity run.",
+        "After choosing an alpha, rerun train.py once with --evaluate-test.",
     ])
     text = "\n".join(lines)
     print("\n" + text)
@@ -323,9 +286,7 @@ def _write_results(results, run_dir, auc_tolerance):
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     axes[0].plot(alphas, aucs, marker="o")
-    axes[0].axhline(threshold, color="red", linestyle="--", label="Eligibility threshold")
     axes[0].set(xlabel="Alpha", ylabel="Best validation AUC", title="Alpha vs AUC")
-    axes[0].legend()
 
     axes[1].plot(alphas, alignments, marker="o", color="seagreen")
     axes[1].set(xlabel="Alpha", ylabel="Validation Grad-CAM inside mask (%)",
@@ -342,7 +303,6 @@ def _write_results(results, run_dir, auc_tolerance):
     fig.tight_layout()
     fig.savefig(os.path.join(run_dir, "alpha_sensitivity.png"), dpi=150)
     plt.close(fig)
-    return selected
 
 
 def _write_run_info(run_dir, args, train_nods, val_nods, test_nods, device):
@@ -368,8 +328,8 @@ def _write_run_info(run_dir, args, train_nods, val_nods, test_nods, device):
         f"Alphas: {args.alphas}",
         f"Epochs per alpha: {args.epochs}",
         f"Batch size: {args.batch_size}",
-        f"AUC tolerance: {args.auc_tolerance}",
-        "Selection data: validation only",
+        "Data used for sensitivity table: validation only",
+        "Automatic alpha selection: no",
         "Held-out test evaluated: no",
         "",
         f"Train: {len(train_nods)} samples, {len(train_patients)} patients",
@@ -405,10 +365,8 @@ def main():
                         help=f"Epochs per alpha (default: {EPOCHS})")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                         help=f"Batch size (default: {BATCH_SIZE})")
-    parser.add_argument("--auc-tolerance", type=float, default=0.01,
-                        help="Maximum validation-AUC drop from alpha=0 for eligibility")
     parser.add_argument("--keep-checkpoints", action="store_true",
-                        help="Keep every trial checkpoint instead of only the selected one")
+                        help="Keep every trial checkpoint for later manual inspection")
     args = parser.parse_args()
     try:
         args.alphas = _validate_alphas(args.alphas)
@@ -419,9 +377,6 @@ def main():
         parser.error("--epochs must be at least 1")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
-    if args.auc_tolerance < 0:
-        parser.error("--auc-tolerance must be non-negative")
-
     run_id = args.run_id or _make_run_id()
     run_dir = os.path.join(RESULTS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=False)
@@ -435,6 +390,7 @@ def main():
     print(f"Device: {device}")
     print(f"Alphas: {args.alphas}")
     print("Held-out test set will not be evaluated.")
+    print("No automatic alpha selection will be applied.")
 
     results = []
     for alpha in args.alphas:
@@ -448,10 +404,7 @@ def main():
             )
         )
 
-    selected = _write_results(results, run_dir, args.auc_tolerance)
-    selected_checkpoint = selected["checkpoint"]
-    final_checkpoint = os.path.join(run_dir, "selected_model.pt")
-    os.replace(selected_checkpoint, final_checkpoint)
+    _write_results(results, run_dir)
 
     if not args.keep_checkpoints:
         for result in results:
@@ -459,8 +412,8 @@ def main():
             if os.path.exists(checkpoint):
                 os.remove(checkpoint)
 
-    print(f"Selected model saved -> {final_checkpoint}")
-    print("Use the selected alpha for later final experiments; do not inspect test data here.")
+    print("Alpha sensitivity complete.")
+    print("Choose an alpha from alpha_sensitivity.txt/png, then rerun train.py for final testing.")
 
 
 if __name__ == "__main__":

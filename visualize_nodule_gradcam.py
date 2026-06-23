@@ -61,6 +61,15 @@ def _middle_slice_idx(annotation_group):
     return int(indices[len(indices) // 2])
 
 
+def _mean_annotation_attr(annotation_group, name):
+    values = [
+        float(getattr(annotation, name))
+        for annotation in annotation_group
+        if getattr(annotation, name, None) is not None
+    ]
+    return float(np.mean(values)) if values else float("nan")
+
+
 def _prepare_image(raw_slice):
     image = np.clip(raw_slice.astype(np.float32), HU_MIN, HU_MAX)
     image = (image - HU_MIN) / (HU_MAX - HU_MIN)
@@ -88,7 +97,7 @@ def _reader_mask(annotation, slice_idx, shape):
     return mask
 
 
-def _annotation_masks(annotation_group, slice_idx, shape):
+def _annotation_masks_full(annotation_group, slice_idx, shape):
     reader_masks = [
         _reader_mask(annotation, slice_idx, shape)
         for annotation in annotation_group
@@ -106,11 +115,26 @@ def _annotation_masks(annotation_group, slice_idx, shape):
     factors = (IMG_SIZE / shape[0], IMG_SIZE / shape[1])
     union_224 = zoom(union.astype(np.uint8), factors, order=0).astype(bool)
     majority_224 = zoom(majority.astype(np.uint8), factors, order=0).astype(bool)
-    return union_224, majority_224, len(reader_masks)
+    return union, majority, union_224, majority_224, len(reader_masks)
+
+
+def _annotation_masks(annotation_group, slice_idx, shape):
+    _, _, union_224, majority_224, readers = _annotation_masks_full(
+        annotation_group,
+        slice_idx,
+        shape,
+    )
+    return union_224, majority_224, readers
 
 
 def _eligible_candidates(scan):
     volume = scan.to_volume()
+    zvals = np.sort(scan.slice_zvals)
+    slice_spacing_mm = (
+        float(np.median(np.diff(zvals)))
+        if len(zvals) > 1
+        else float(scan.slice_thickness)
+    )
     candidates = []
     for group_index, annotation_group in enumerate(scan.cluster_annotations()):
         if len(annotation_group) < MIN_RADIOLOGISTS:
@@ -122,12 +146,20 @@ def _eligible_candidates(scan):
         slice_idx = _middle_slice_idx(annotation_group)
         slice_idx = int(np.clip(slice_idx, 0, volume.shape[2] - 1))
         raw_slice = volume[:, :, slice_idx]
+        adjacent_raw_slices = []
+        for adjacent_idx in (slice_idx - 1, slice_idx + 1):
+            if 0 <= adjacent_idx < volume.shape[2]:
+                adjacent_raw_slices.append(volume[:, :, adjacent_idx].astype(np.float32))
         image = _prepare_image(raw_slice)
-        union, majority, readers = _annotation_masks(
+        pixel_spacing = float(scan.pixel_spacing)
+        effective_spacing_row_mm = pixel_spacing * raw_slice.shape[0] / IMG_SIZE
+        effective_spacing_col_mm = pixel_spacing * raw_slice.shape[1] / IMG_SIZE
+        union_raw, majority_raw, union, majority, readers = _annotation_masks_full(
             annotation_group, slice_idx, raw_slice.shape
         )
         candidates.append(
             {
+                "raw_slice": raw_slice.astype(np.float32),
                 "image": image,
                 "hash": _image_hash(image),
                 "label": label,
@@ -136,7 +168,19 @@ def _eligible_candidates(scan):
                 "group_index": group_index,
                 "slice_idx": slice_idx,
                 "mean_rating": mean_rating,
+                "mean_subtlety": _mean_annotation_attr(annotation_group, "subtlety"),
+                "mean_margin": _mean_annotation_attr(annotation_group, "margin"),
+                "mean_spiculation": _mean_annotation_attr(annotation_group, "spiculation"),
+                "mean_texture": _mean_annotation_attr(annotation_group, "texture"),
                 "reader_count": readers,
+                "source_shape": raw_slice.shape,
+                "pixel_spacing_mm": pixel_spacing,
+                "slice_spacing_mm": slice_spacing_mm,
+                "effective_spacing_row_mm": effective_spacing_row_mm,
+                "effective_spacing_col_mm": effective_spacing_col_mm,
+                "adjacent_raw_slices": adjacent_raw_slices,
+                "union_raw": union_raw,
+                "majority_raw": majority_raw,
                 "union": union,
                 "majority": majority,
             }
@@ -204,7 +248,7 @@ def _match_test_samples(test_samples, max_matches):
                 match = dict(candidate)
                 match["lung_mask"] = np.asarray(cached["mask"]).astype(bool)
                 matches.append(match)
-                candidates.remove(candidate)
+                candidates = [c for c in candidates if c is not candidate]
                 if len(matches) >= max_matches:
                     break
     return matches

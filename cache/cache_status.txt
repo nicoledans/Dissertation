@@ -1,7 +1,7 @@
-Status:       IN PROGRESS
-Last updated:  2026-06-09 22:10:12
-Cache path:   cache/cache_ts.pkl
-Collected:    974 / 2000 samples
-  Benign:     611
-  Malignant:  363
-  TS masks:   970/974
+Status:       COMPLETE
+Last cached:   2026-06-16 15:22:13
+Cache path:   cache/cache_hu_25d_2p5mm_masks.pkl
+Collected:    1553 / 2000 samples
+  Benign:     967
+  Malignant:  586
+  TS masks:   0/1553

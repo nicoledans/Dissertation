@@ -83,7 +83,15 @@ def _evaluate_classification(model, loader, criterion, device):
     }
 
 
-def _adaptive_margin(model, logits, masks, delta):
+def _adaptive_margin(
+    model,
+    logits,
+    labels,
+    masks,
+    delta,
+    confidence_mode,
+    min_attention_weight,
+):
     """Zhang-style confidence-adaptive margin using predicted-class Grad-CAM."""
     raw_cam = model.differentiable_gradcam(
         model.class_scores(logits), normalise=False
@@ -103,8 +111,33 @@ def _adaptive_margin(model, logits, masks, delta):
         outside_mask.sum(dim=(1, 2)) + 1e-8
     )
     margin = F.relu(outside_mean - inside_mean + delta)
-    confidence = 2.0 * (torch.sigmoid(logits).detach() - 0.5).abs()
-    return confidence * margin, margin, confidence, inside_mean, outside_mean, blank
+    probability = torch.sigmoid(logits).detach()
+    labels_detached = labels.detach().to(dtype=probability.dtype)
+    correct_class_probability = torch.where(
+        labels_detached > 0.5,
+        probability,
+        1.0 - probability,
+    )
+    if confidence_mode == "distance":
+        attention_weight = 2.0 * (probability - 0.5).abs()
+    elif confidence_mode == "correct-class":
+        attention_weight = (
+            min_attention_weight
+            + (1.0 - min_attention_weight) * correct_class_probability
+        )
+    else:
+        raise ValueError(f"Unknown confidence mode: {confidence_mode}")
+    attention_weight = attention_weight.detach()
+    correct_class_probability = correct_class_probability.detach()
+    return (
+        attention_weight * margin,
+        margin,
+        correct_class_probability,
+        attention_weight,
+        inside_mean,
+        outside_mean,
+        blank,
+    )
 
 
 def _gradient_groups(model):
@@ -286,8 +319,22 @@ def _train_trial(alpha, delta, train_nods, val_nods, device, args, trial_dir):
             optimizer.zero_grad()
             logits = model(images).squeeze(1)
             bce = criterion(logits, labels)
-            adaptive, margin, confidence, inside, outside, blank = _adaptive_margin(
-                model, logits, masks, delta
+            (
+                adaptive,
+                margin,
+                correct_class_probability,
+                attention_weight,
+                inside,
+                outside,
+                blank,
+            ) = _adaptive_margin(
+                model,
+                logits,
+                labels,
+                masks,
+                delta,
+                args.confidence_mode,
+                args.min_attention_weight,
             )
             adaptive_loss = adaptive.mean()
             total = bce + alpha * adaptive_loss
@@ -304,7 +351,11 @@ def _train_trial(alpha, delta, train_nods, val_nods, device, args, trial_dir):
             sums["adaptive"] += adaptive_loss.item() * n
             sums["total"] += total.item() * n
             sums["margin"] += margin.detach().sum().item()
-            sums["confidence"] += confidence.detach().sum().item()
+            sums["confidence"] += attention_weight.detach().sum().item()
+            sums["correct_class_probability"] += (
+                correct_class_probability.detach().sum().item()
+            )
+            sums["attention_weight"] += attention_weight.detach().sum().item()
             sums["inside_mean"] += inside.detach().sum().item()
             sums["outside_mean"] += outside.detach().sum().item()
             sums["violation"] += (margin.detach() > 0).sum().item()
@@ -379,11 +430,19 @@ def _write_info(run_dir, args, device, train, val, test):
         f"AUC tolerance: {args.auc_tolerance}",
         f"Optimizer: AdamW, learning rate {LR}, weight decay {args.weight_decay}",
         f"Freeze through: {args.freeze_through}",
+        f"Confidence mode: {args.confidence_mode}",
+        f"Minimum attention weight: {args.min_attention_weight}",
+        "Augmentation: none",
         "Explanation: predicted-class Grad-CAM (Zhang used CAM)",
         "Supervision: fixed binary HU lung mask (Zhang used learned nodule SEM)",
         "Loss: BCE + alpha * detached-confidence * margin",
         "Margin: relu(mean_outside - mean_inside + delta)",
-        "Confidence: 2 * abs(sigmoid(logit) - 0.5), detached",
+        (
+            "Distance confidence: 2 * abs(sigmoid(logit) - 0.5), detached"
+            if args.confidence_mode == "distance"
+            else "Correct-class confidence: weight = min_attention_weight + "
+                 "(1 - min_attention_weight) * P(true class), detached"
+        ),
         "Checkpoint selection: validation AUC",
         "Held-out test evaluated: no",
         "Frozen modules remain in eval mode so BatchNorm statistics do not update",
@@ -472,6 +531,24 @@ def main():
         default=0.0,
         help="AdamW weight decay (recommended polished-model value: 1e-4)",
     )
+    parser.add_argument(
+        "--confidence-mode",
+        choices=["distance", "correct-class"],
+        default="distance",
+        help=(
+            "Attention weighting mode: existing distance-from-0.5 confidence, "
+            "or correct-class probability with a minimum weight."
+        ),
+    )
+    parser.add_argument(
+        "--min-attention-weight",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum attention weight for --confidence-mode correct-class "
+            "(default: 0.25)."
+        ),
+    )
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1:
         parser.error("epochs and batch-size must be positive")
@@ -481,6 +558,12 @@ def main():
         parser.error("--auc-tolerance must be non-negative")
     if not np.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error("--weight-decay must be finite and non-negative")
+    if (
+        not np.isfinite(args.min_attention_weight)
+        or args.min_attention_weight < 0
+        or args.min_attention_weight > 1
+    ):
+        parser.error("--min-attention-weight must be finite and between 0 and 1")
 
     run_id = args.run_id or datetime.now().strftime("adaptive_grid_%Y%m%d_%H%M%S")
     run_dir = os.path.join(RESULTS_DIR, run_id)

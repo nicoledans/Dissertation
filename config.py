@@ -16,7 +16,11 @@ CACHE_PATH = "cache/cache.pkl"
 HU_CACHE_PATH = "cache/cache_hu_fixed.pkl"
 NODULE_CROP_CACHE_PATH = "cache/cache_hu_nodule_128mm.pkl"
 TS_CACHE_PATH = "cache/cache_ts.pkl"
+HU_25D_CACHE_PATH = "cache/cache_hu_25d_2p5mm.pkl"
+HU_2D_MATCHED_25D_CACHE_PATH = "cache/cache_hu_2d_matched_25d_2p5mm.pkl"
 TRAIN_CACHE_PATH = HU_CACHE_PATH
+SLICE_OFFSET_MM = 2.5
+SLICE_OFFSET_TOLERANCE_MM = 1.25
 MIN_RADIOLOGISTS = 2
 MALIGNANCY_THRESHOLD = 3
 # Split ratios: 70/15/15 train/val/test

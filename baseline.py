@@ -56,6 +56,7 @@
 import os           # file-system operations: makedirs, path joins, existence checks
 import argparse     # parse command-line flags so the script is reconfigurable
                     # without editing source code
+import csv          # write per-sample prediction audit files
 from collections import Counter     # count benign / malignant labels per split
                                     # using a hash-map tally — cleaner than two
                                     # separate list comprehensions
@@ -243,6 +244,84 @@ def _gradcam_mask_stats(model, val_nods, device):
     # average alignment and its variability across samples.
 
 
+def _classification_metrics(labels, probs):
+    """Return threshold-free and threshold-0.5 classification metrics."""
+    preds_bin = [1 if p >= 0.5 else 0 for p in probs]
+    try:
+        auc = roc_auc_score(labels, probs)
+    except ValueError:
+        auc = float("nan")
+
+    acc = sum(p == l for p, l in zip(preds_bin, labels)) / max(len(labels), 1)
+    try:
+        f1 = f1_score(labels, preds_bin, zero_division=0)
+        tn, fp, fn, tp = confusion_matrix(labels, preds_bin, labels=[0, 1]).ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+    except Exception:
+        f1 = sensitivity = specificity = float("nan")
+
+    return {
+        "auc": auc,
+        "acc": acc,
+        "f1": f1,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+    }
+
+
+def _predict_probabilities(model, nods, device, batch_size, criterion=None, num_workers=0):
+    """Run inference and optionally return mean BCE loss for a split."""
+    model.eval()
+    ds = LIDCDataset(nods)
+    loader = DataLoader(
+        ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+
+    all_probs, all_labels = [], []
+    total_loss = 0.0
+    n_loss = 0
+    with torch.no_grad():
+        for images, _masks, labels in loader:
+            images = images.to(device)
+            labels_device = labels.to(device)
+            logits = model(images).squeeze(1)
+            if criterion is not None:
+                total_loss += criterion(logits, labels_device).item() * images.size(0)
+                n_loss += images.size(0)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_labels.extend(labels.numpy().tolist())
+            model.clear_hooks()
+
+    mean_loss = total_loss / n_loss if n_loss else float("nan")
+    return all_labels, all_probs, mean_loss
+
+
+def _write_predictions_csv(path, nods, labels, probs):
+    """Save per-sample probabilities so later error analysis does not need reruns."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "index",
+            "patient_id",
+            "true_label",
+            "prob_malignant",
+            "pred_label_at_0p5",
+            "correct_at_0p5",
+        ])
+        for index, (sample, label, prob) in enumerate(zip(nods, labels, probs)):
+            pred = 1 if prob >= 0.5 else 0
+            writer.writerow([
+                index,
+                sample.get("patient_id", ""),
+                int(label),
+                f"{prob:.8f}",
+                pred,
+                int(pred == int(label)),
+            ])
+
+
 # =============================================================================
 # TEST SET EVALUATION
 # =============================================================================
@@ -264,7 +343,7 @@ def _gradcam_mask_stats(model, val_nods, device):
 # Grad-CAM %  : mean % of activation inside the lung mask on the test set
 #               (same computation as validation, for completeness).
 # =============================================================================
-def _test_evaluate(model, test_nods, device, run_dir, batch_size):
+def _test_evaluate(model, test_nods, device, run_dir, batch_size, criterion=None, num_workers=0):
     # test_nods  : list of sample dicts for the held-out test patients.
     # device     : "cuda" or "cpu" — must match where the model lives.
     # run_dir    : path to the current run's results directory; output is written here.
@@ -275,11 +354,13 @@ def _test_evaluate(model, test_nods, device, run_dir, batch_size):
 
     model.eval()
     ds = LIDCDataset(test_nods)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     # shuffle=False: evaluation order is irrelevant to metrics and keeping
     # it deterministic makes debugging easier.
 
     all_preds, all_labels = [], []
+    total_loss = 0.0
+    n_loss = 0
     with torch.no_grad():
         # no_grad() disables the autograd engine entirely — no gradient graph
         # is built, halving memory usage and speeding up inference.
@@ -287,7 +368,11 @@ def _test_evaluate(model, test_nods, device, run_dir, batch_size):
             # _masks: underscore prefix signals intentional discard —
             # the baseline doesn't use masks for prediction.
             images = images.to(device)
+            labels_device = labels.to(device)
             logits = model(images).squeeze(1)
+            if criterion is not None:
+                total_loss += criterion(logits, labels_device).item() * images.size(0)
+                n_loss += images.size(0)
             probs = torch.sigmoid(logits).cpu().numpy()
             # sigmoid maps raw logits (unbounded) to probabilities in [0, 1].
             # .cpu() moves from GPU to host memory; .numpy() converts for
@@ -328,6 +413,14 @@ def _test_evaluate(model, test_nods, device, run_dir, batch_size):
         f1 = sensitivity = specificity = float("nan")
         # Broad except: catches any remaining degenerate input (e.g. empty arrays).
 
+    test_loss = total_loss / n_loss if n_loss else float("nan")
+    _write_predictions_csv(
+        os.path.join(run_dir, "test_predictions_baseline.csv"),
+        test_nods,
+        all_labels,
+        all_preds,
+    )
+
     print("\nComputing test Grad-CAM mask alignment...")
     gcam_mean, gcam_std, gcam_n = _gradcam_mask_stats(model, test_nods, device)
     # Runs the same mask-alignment computation on the test set for a complete
@@ -341,6 +434,7 @@ def _test_evaluate(model, test_nods, device, run_dir, batch_size):
     lines = [
         "=== TEST SET EVALUATION (Baseline) ===",
         f"Test samples:           {len(all_labels)}",
+        f"Test BCE loss:          {_f(test_loss)}",
         f"Test AUC:               {_f(auc)}",
         f"Test Accuracy:          {_f(acc)}",
         f"Test F1:                {_f(f1)}",
@@ -500,6 +594,16 @@ def train_baseline():
                         help=f"Batch size (default: {BATCH_SIZE})")
     # --batch-size is forwarded to both training and test evaluation DataLoaders
     # so memory usage is consistent across the run.
+    parser.add_argument("--lr", type=float, default=LR,
+                        help=f"Learning rate (default: {LR})")
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"],
+                        help="Optimizer to use: adam preserves old baseline; adamw enables decoupled weight decay.")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="Weight decay for optimizer regularisation (default: 0.0)")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers. Keep 0 on Windows unless you know multiprocessing is stable.")
+    parser.add_argument("--augment", action="store_true",
+                        help="Apply conservative CT-safe augmentation to training samples only.")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -559,13 +663,17 @@ def train_baseline():
     # ------------------------------------------------------------------
     # Datasets and DataLoaders
     # ------------------------------------------------------------------
-    train_ds = LIDCDataset(train_nods)
+    train_ds = LIDCDataset(train_nods, augment=args.augment)
     val_ds   = LIDCDataset(val_nods)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
+    )
     # shuffle=True: randomises sample order within each epoch so the model
     # does not overfit to the ordering of patients in the cache.
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    )
     # shuffle=False: validation order is irrelevant to metrics; fixed order
     # makes it easier to track per-sample predictions across epochs.
 
@@ -588,20 +696,60 @@ def train_baseline():
     # not learn to always predict benign.  class_weights() computes this ratio
     # from the training split.
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
     # Adam: adaptive moment estimation.  Adjusts the effective learning rate
     # per parameter, making it robust to the sparse gradients and noisy losses
     # common when training on small medical image datasets.
-    # LR comes from config and is not CLI-overridable; change config.py if needed.
+    # AdamW decouples weight decay from the gradient update, which is usually
+    # the cleaner choice when regularising a pretrained backbone.
+
+    run_info_path = os.path.join(run_dir, "baseline_info.txt")
+    with open(run_info_path, "w") as f:
+        f.write("=== BASELINE TRAINING CONFIG ===\n")
+        f.write("Goal: AUC-first classifier training; no attention penalty in loss.\n")
+        f.write(f"Cache path: {cache_path}\n")
+        f.write(f"Device: {device}\n")
+        f.write(f"Epochs requested: {args.epochs}\n")
+        f.write(f"Batch size: {args.batch_size}\n")
+        f.write(f"Learning rate: {args.lr}\n")
+        f.write(f"Optimizer: {args.optimizer}\n")
+        f.write(f"Weight decay: {args.weight_decay}\n")
+        f.write(f"Num workers: {args.num_workers}\n")
+        f.write(f"Training augmentation: {args.augment}\n")
+        if args.augment:
+            f.write("Augmentation details: training-only; validation/test unaugmented; unchanged p=0.25; hflip p=0.5; rotate +/-7 deg; translate +/-4%; scale 0.96-1.04; contrast 0.92-1.08; brightness +/-0.03; noise sigma 0.01 with p=0.25.\n")
+            f.write("Attention penalty: none; this is a weighted-BCE classification-only baseline.\n")
+        f.write(f"Loss: BCEWithLogitsLoss(pos_weight={pos_weight.item():.6f})\n")
+        f.write(f"Train/val/test samples: {len(train_nods)}/{len(val_nods)}/{len(test_nods)}\n")
 
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
     log_path = os.path.join(run_dir, "baseline_log.txt")
+    epochs_csv_path = os.path.join(run_dir, "baseline_epochs.csv")
     best_auc = 0.0
+    best_epoch = 0
     best_model_path = os.path.join(run_dir, "baseline_model.pt")
 
-    with open(log_path, "w") as log_f:
+    with open(log_path, "w") as log_f, open(epochs_csv_path, "w", newline="") as epoch_csv_f:
+        epoch_writer = csv.writer(epoch_csv_f)
+        epoch_writer.writerow([
+            "epoch",
+            "train_bce",
+            "val_bce",
+            "val_auc",
+            "val_accuracy_0p5",
+            "val_f1_0p5",
+            "val_sensitivity_0p5",
+            "val_specificity_0p5",
+        ])
         for epoch in range(1, args.epochs + 1):
 
             # ── Training phase ────────────────────────────────────────────
@@ -609,6 +757,8 @@ def train_baseline():
             # train() re-enables dropout and switches batch norm back to
             # computing statistics from the current mini-batch (rather than
             # using running statistics as in eval mode).
+            train_loss_sum = 0.0
+            train_seen = 0
             for batch_idx, (images, _masks, labels) in enumerate(train_loader):
                 # _masks: intentionally unused — baseline trains without any
                 # mask signal.  The leading underscore is a Python convention
@@ -628,6 +778,8 @@ def train_baseline():
                 total_loss = criterion(logits, labels)
                 # BCEWithLogitsLoss: compares per-sample logits to binary
                 # float labels {0.0, 1.0}.
+                train_loss_sum += total_loss.item() * images.size(0)
+                train_seen += images.size(0)
 
                 total_loss.backward()
                 # Compute gradients of total_loss w.r.t. all model parameters
@@ -652,12 +804,17 @@ def train_baseline():
             # ── Validation phase ─────────────────────────────────────────
             model.eval()
             all_preds, all_labels = [], []
+            val_loss_sum = 0.0
+            val_seen = 0
             with torch.no_grad():
                 # no_grad() prevents building a gradient graph during
                 # validation, saving memory and speeding up inference.
                 for images, _masks, labels in val_loader:
                     images = images.to(device)
+                    labels_device = labels.to(device)
                     logits = model(images).squeeze(1)
+                    val_loss_sum += criterion(logits, labels_device).item() * images.size(0)
+                    val_seen += images.size(0)
                     probs = torch.sigmoid(logits).cpu().numpy()
                     all_preds.extend(probs.tolist())
                     all_labels.extend(labels.numpy().tolist())
@@ -668,6 +825,8 @@ def train_baseline():
 
             preds_bin = [1 if p >= 0.5 else 0 for p in all_preds]
             acc = sum(p == l for p, l in zip(preds_bin, all_labels)) / max(len(all_labels), 1)
+            train_loss_mean = train_loss_sum / max(train_seen, 1)
+            val_loss_mean = val_loss_sum / max(val_seen, 1)
             try:
                 auc = roc_auc_score(all_labels, all_preds)
             except ValueError:
@@ -677,9 +836,27 @@ def train_baseline():
                 # Treating AUC as NaN causes the checkpoint-saving condition
                 # below to skip this epoch cleanly.
 
-            log_line = f"Epoch {epoch:02d} | Val Acc {acc:.4f} | Val AUC {auc:.4f}\n"
+            val_metrics = _classification_metrics(all_labels, all_preds)
+            log_line = (
+                f"Epoch {epoch:02d} | Train BCE {train_loss_mean:.4f} | "
+                f"Val BCE {val_loss_mean:.4f} | Val AUC {auc:.4f} | "
+                f"Val Acc {acc:.4f} | Val F1 {val_metrics['f1']:.4f} | "
+                f"Val Sens {val_metrics['sensitivity']:.4f} | "
+                f"Val Spec {val_metrics['specificity']:.4f}\n"
+            )
             log_f.write(log_line)
+            epoch_writer.writerow([
+                epoch,
+                f"{train_loss_mean:.8f}",
+                f"{val_loss_mean:.8f}",
+                f"{auc:.8f}",
+                f"{acc:.8f}",
+                f"{val_metrics['f1']:.8f}",
+                f"{val_metrics['sensitivity']:.8f}",
+                f"{val_metrics['specificity']:.8f}",
+            ])
             log_f.flush()
+            epoch_csv_f.flush()
             # flush() writes the line to disk immediately rather than waiting
             # for the file buffer to fill.  This lets you `tail -f baseline_log.txt`
             # to watch training progress in real time.
@@ -688,6 +865,7 @@ def train_baseline():
             # ── Model checkpointing ───────────────────────────────────────
             if not np.isnan(auc) and auc > best_auc:
                 best_auc = auc
+                best_epoch = epoch
                 torch.save(model.state_dict(), best_model_path)
                 # state_dict() saves only learned parameters (weights and biases),
                 # not the model architecture.  This is standard PyTorch practice:
@@ -708,6 +886,32 @@ def train_baseline():
         # map_location=device: ensures a checkpoint saved on GPU is correctly
         # loaded on a CPU-only machine (and vice versa).  Without this, loading
         # a GPU checkpoint on CPU raises a RuntimeError.
+
+    val_labels, val_probs, val_loss = _predict_probabilities(
+        model,
+        val_nods,
+        device,
+        args.batch_size,
+        criterion=criterion,
+        num_workers=args.num_workers,
+    )
+    val_metrics = _classification_metrics(val_labels, val_probs)
+    _write_predictions_csv(
+        os.path.join(run_dir, "val_predictions_baseline.csv"),
+        val_nods,
+        val_labels,
+        val_probs,
+    )
+    with open(run_info_path, "a") as f:
+        f.write("\n=== BEST VALIDATION CHECKPOINT ===\n")
+        f.write(f"Best epoch: {best_epoch}\n")
+        f.write(f"Best validation AUC during training: {best_auc:.6f}\n")
+        f.write(f"Reloaded validation BCE: {val_loss:.6f}\n")
+        f.write(f"Reloaded validation AUC: {val_metrics['auc']:.6f}\n")
+        f.write(f"Reloaded validation accuracy at 0.5: {val_metrics['acc']:.6f}\n")
+        f.write(f"Reloaded validation F1 at 0.5: {val_metrics['f1']:.6f}\n")
+        f.write(f"Reloaded validation sensitivity at 0.5: {val_metrics['sensitivity']:.6f}\n")
+        f.write(f"Reloaded validation specificity at 0.5: {val_metrics['specificity']:.6f}\n")
 
     # ------------------------------------------------------------------
     # Grad-CAM mask alignment — validation set
@@ -846,7 +1050,15 @@ def train_baseline():
     # Test set evaluation
     # ------------------------------------------------------------------
     print("\n--- Test Set Evaluation ---")
-    _test_evaluate(model, test_nods, device, run_dir, args.batch_size)
+    _test_evaluate(
+        model,
+        test_nods,
+        device,
+        run_dir,
+        args.batch_size,
+        criterion=criterion,
+        num_workers=args.num_workers,
+    )
 
 
 if __name__ == "__main__":

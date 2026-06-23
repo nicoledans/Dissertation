@@ -119,6 +119,8 @@ from config import (
     SEED as _CFG_SEED,                          # RNG seed for scan shuffling
     HU_MIN as _CFG_HU_MIN,                      # lower HU clip bound for normalisation
     HU_MAX as _CFG_HU_MAX,                      # upper HU clip bound for normalisation
+    SLICE_OFFSET_MM as _CFG_SLICE_OFFSET_MM,
+    SLICE_OFFSET_TOLERANCE_MM as _CFG_SLICE_OFFSET_TOLERANCE_MM,
 )
 
 # ---------------------------------------------------------------------------
@@ -199,6 +201,9 @@ HU_MAX = _CFG_HU_MAX
 # The window [-1000, 400] is a standard lung window that retains the full
 # dynamic range relevant for lung nodule detection without letting extreme
 # implant artefacts (+3000 HU) distort the normalised scale.
+
+SLICE_OFFSET_MM = _CFG_SLICE_OFFSET_MM
+SLICE_OFFSET_TOLERANCE_MM = _CFG_SLICE_OFFSET_TOLERANCE_MM
 
 
 # =============================================================================
@@ -540,6 +545,76 @@ def _get_consensus_nodule_center(ann_group):
     return tuple(float(value) for value in np.mean(centers, axis=0))
 
 
+def _select_25d_slice_indices(scan, middle_idx, requested_offset_mm, tolerance_mm):
+    """Select native slices closest to -offset, 0, +offset mm around middle_idx.
+
+    The selection uses actual DICOM slice centre positions (`slice_zvals`) rather
+    than nominal slice thickness. Samples are rejected if either side cannot
+    provide a distinct native slice within the requested tolerance. This avoids
+    silently duplicating or clamping slices, which would create fake 2.5D input.
+    """
+    zvals = np.asarray(scan.slice_zvals, dtype=np.float64)
+    if zvals.ndim != 1 or len(zvals) <= middle_idx:
+        raise ValueError("slice_zvals are unavailable or shorter than the CT volume.")
+
+    middle_z = float(zvals[middle_idx])
+    requested_offsets = np.array(
+        [-requested_offset_mm, 0.0, requested_offset_mm],
+        dtype=np.float64,
+    )
+
+    selected = []
+    actual_offsets = []
+    offset_errors = []
+    for requested in requested_offsets:
+        target_z = middle_z + requested
+        idx = int(np.argmin(np.abs(zvals - target_z)))
+        actual = float(zvals[idx] - middle_z)
+        error = abs(actual - float(requested))
+        selected.append(idx)
+        actual_offsets.append(actual)
+        offset_errors.append(error)
+
+    if selected[1] != int(middle_idx):
+        raise ValueError("closest zero-offset slice is not the selected middle slice.")
+    if len(set(selected)) != 3:
+        raise ValueError("2.5D neighbours collapse onto the same native slice.")
+    if not (actual_offsets[0] < 0.0 < actual_offsets[2]):
+        raise ValueError("2.5D neighbours are not on opposite sides of the middle slice.")
+    if offset_errors[0] > tolerance_mm or offset_errors[2] > tolerance_mm:
+        raise ValueError(
+            "2.5D neighbour is outside tolerance: "
+            f"errors={offset_errors}, tolerance={tolerance_mm:g} mm."
+        )
+
+    return {
+        "indices": [int(value) for value in selected],
+        "requested_offsets_mm": [float(value) for value in requested_offsets],
+        "actual_offsets_mm": [float(value) for value in actual_offsets],
+        "offset_error_mm": [float(value) for value in offset_errors],
+        "middle_z_mm": middle_z,
+    }
+
+
+def _normalise_hu_slice(slice_2d):
+    """Clip a raw HU slice to the lung window and scale it to [0, 1]."""
+    slice_2d = np.clip(slice_2d.astype(np.float32), HU_MIN, HU_MAX)
+    return (slice_2d - HU_MIN) / (HU_MAX - HU_MIN)
+
+
+def _resize_image_224(image_2d):
+    zh = 224.0 / image_2d.shape[0]
+    zw = 224.0 / image_2d.shape[1]
+    return zoom(image_2d, (zh, zw), order=1).astype(np.float32)
+
+
+def _resize_mask_224(mask_2d):
+    zh = 224.0 / mask_2d.shape[0]
+    zw = 224.0 / mask_2d.shape[1]
+    mask_224 = zoom(mask_2d.astype(np.float32), (zh, zw), order=0)
+    return (mask_224 > 0.5).astype(np.uint8)
+
+
 def _extract_square(array_2d, center, side_pixels, pad_value):
     """Extract a fixed square around center, padding beyond image edges."""
     side_pixels = int(side_pixels)
@@ -698,9 +773,45 @@ def main():
             "in mm instead of full CT slices (recommended: 128)"
         ),
     )
+    parser.add_argument(
+        "--slice-offset-mm",
+        type=float,
+        default=None,
+        help=(
+            "Build 2.5D input by stacking native slices closest to "
+            "-offset, 0, +offset mm around the selected middle slice "
+            f"(default if used from config: {SLICE_OFFSET_MM:g})"
+        ),
+    )
+    parser.add_argument(
+        "--slice-offset-tolerance-mm",
+        type=float,
+        default=SLICE_OFFSET_TOLERANCE_MM,
+        help=(
+            "Maximum allowed absolute error in mm for each 2.5D neighbour "
+            f"(default: {SLICE_OFFSET_TOLERANCE_MM:g})"
+        ),
+    )
+    parser.add_argument(
+        "--matched-2d-cache-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional output path for a matched 2D cache containing the same "
+            "accepted nodules as the 2.5D cache, but with the middle slice only."
+        ),
+    )
     args = parser.parse_args()
     if args.nodule_crop_mm is not None and args.nodule_crop_mm <= 0:
         parser.error("--nodule-crop-mm must be positive")
+    if args.slice_offset_mm is not None and args.slice_offset_mm <= 0:
+        parser.error("--slice-offset-mm must be positive")
+    if args.slice_offset_tolerance_mm <= 0:
+        parser.error("--slice-offset-tolerance-mm must be positive")
+    if args.matched_2d_cache_path and args.slice_offset_mm is None:
+        parser.error("--matched-2d-cache-path only makes sense with --slice-offset-mm")
+    if args.slice_offset_mm is not None and args.nodule_crop_mm is not None:
+        parser.error("2.5D full-slice ablation cannot be combined with --nodule-crop-mm")
 
     SAMPLE_SIZE = args.sample_size
     # Local variable shadows the module-level constant when --sample-size
@@ -709,6 +820,7 @@ def main():
 
     cache_out = args.cache_path if args.cache_path else CACHE_PATH
     # Use the CLI override if provided; otherwise fall back to config default.
+    slice_offset_mm = args.slice_offset_mm
 
     checkpoint_out = cache_out.replace(".pkl", "_checkpoint.pkl")
     # Derive the checkpoint path from the cache path so they are always
@@ -757,12 +869,21 @@ def main():
             # the user for a long wait.
 
     print(f"[CACHE] Output â†’ {cache_out}")
+    if args.matched_2d_cache_path:
+        os.makedirs(os.path.dirname(os.path.abspath(args.matched_2d_cache_path)), exist_ok=True)
+        print(f"[CACHE] Matched 2D output -> {args.matched_2d_cache_path}")
     if args.nodule_crop_mm is None:
         print("[INPUT] Full axial CT slices.")
     else:
         print(
             f"[INPUT] Consensus nodule-centred crops: "
             f"{args.nodule_crop_mm:g} mm square."
+        )
+    if slice_offset_mm is not None:
+        print(
+            f"[INPUT] 2.5D stack: {-slice_offset_mm:g}, 0, "
+            f"+{slice_offset_mm:g} mm; tolerance "
+            f"{args.slice_offset_tolerance_mm:g} mm."
         )
 
     # ------------------------------------------------------------------
@@ -794,10 +915,18 @@ def main():
             # resume from the stale checkpoint.
             print("[FRESH] Deleted existing checkpoint, starting from scratch.")
 
+    def _sample_duplicate_image(sample):
+        if args.matched_2d_cache_path and "_matched_2d_image" in sample:
+            return sample["_matched_2d_image"]
+        return sample["image"]
+
     seen_image_hashes = {
-        hashlib.sha256(np.ascontiguousarray(sample["image"]).tobytes()).hexdigest()
+        hashlib.sha256(
+            np.ascontiguousarray(_sample_duplicate_image(sample)).tobytes()
+        ).hexdigest()
         for sample in samples
     }
+    skipped_25d = 0
 
     # ------------------------------------------------------------------
     # Load and shuffle all scans
@@ -981,56 +1110,45 @@ def main():
                             0,
                         )
 
-                    raw_slice = np.clip(raw_slice, HU_MIN, HU_MAX)
-                    # Clamp extreme HU values.
-                    #   Below HU_MIN (-1000): deep-space-black outside the FOV â€”
-                    #     no diagnostic value, just padding artefacts.
-                    #   Above HU_MAX (+400):  metal implants, reconstruction
-                    #     artefacts (+1000 to +3000 HU) â€” would dominate the
-                    #     normalised range and wash out the diagnostically
-                    #     relevant [-1000, 400] window.
-                    # After clipping, all values are in [-1000, 400].
+                    raw_slice_norm = _normalise_hu_slice(raw_slice)
+                    image_2d_224 = _resize_image_224(raw_slice_norm)
 
-                    raw_slice = (raw_slice - HU_MIN) / (HU_MAX - HU_MIN)
-                    # Min-max normalisation to [0, 1]:
-                    #   (x - min) / (max - min)
-                    #   = (x - (-1000)) / (400 - (-1000))
-                    #   = (x + 1000) / 1400
-                    # -1000 HU (air) â†’ 0.0
-                    # +400  HU (bone) â†’ 1.0
-                    # This puts all scans on the same numerical scale regardless
-                    # of scanner calibration differences, which is important for
-                    # stable neural network training.
+                    slice_25d_meta = None
+                    if slice_offset_mm is not None:
+                        try:
+                            slice_25d_meta = _select_25d_slice_indices(
+                                scan,
+                                slice_idx,
+                                slice_offset_mm,
+                                args.slice_offset_tolerance_mm,
+                            )
+                        except ValueError as error:
+                            skipped_25d += 1
+                            print(
+                                f"  WARNING: skipped 2.5D nodule in "
+                                f"{scan.patient_id}, group {nod_idx}: {error}"
+                            )
+                            _save_checkpoint(
+                                samples, scan_idx, nod_idx + 1, checkpoint_out
+                            )
+                            continue
 
-                    # -------------------------------------------------------
-                    # Resize to 224Ã—224
-                    # -------------------------------------------------------
-                    zh = 224.0 / raw_slice.shape[0]
-                    zw = 224.0 / raw_slice.shape[1]
-                    # Compute the zoom factor for each axis.
-                    # shape[0] = rows (height), shape[1] = cols (width).
-                    # For a 512Ã—512 scan: zh = zw = 224/512 â‰ˆ 0.4375.
-                    # Separating zh and zw handles non-square scans correctly.
+                        channels = []
+                        masks_25d = []
+                        for channel_idx in slice_25d_meta["indices"]:
+                            channel_slice = vol[:, :, channel_idx].astype(np.float32)
+                            channels.append(
+                                _resize_image_224(_normalise_hu_slice(channel_slice))
+                            )
+                            masks_25d.append(
+                                _resize_mask_224(_get_lung_mask(channel_slice))
+                            )
+                        image_224 = np.stack(channels, axis=0).astype(np.float32)
+                        masks_25d = np.stack(masks_25d, axis=0).astype(np.uint8)
+                    else:
+                        image_224 = image_2d_224
 
-                    image_224 = zoom(raw_slice, (zh, zw), order=1).astype(np.float32)
-                    # order=1 = bilinear interpolation.
-                    #   Bilinear is the standard choice for image downsampling:
-                    #   it is smooth (no aliasing from nearest-neighbour) but
-                    #   does not over-smooth (unlike bicubic/order=3).
-                    # .astype(np.float32) ensures the output stays in float32
-                    # (zoom may return float64).
-
-                    mask_224 = zoom(lung_mask.astype(np.float32), (zh, zw), order=0)
-                    mask_224 = (mask_224 > 0.5).astype(np.uint8)
-                    # order=0 = nearest-neighbour interpolation for the mask.
-                    #   Masks are binary (0/1); bilinear interpolation would
-                    #   create fractional values at boundaries.  Nearest-neighbour
-                    #   preserves the binary nature.
-                    # We first convert to float32 before zooming because scipy's
-                    # zoom is more numerically stable on float inputs than uint8.
-                    # The > 0.5 threshold then re-binarises (nearest-neighbour
-                    # on a 0/1 mask already guarantees values near 0 or 1, so
-                    # 0.5 is an unambiguous threshold).
+                    mask_224 = _resize_mask_224(lung_mask)
 
                     # -------------------------------------------------------
                     # TS mask: extract 2-D slice and resize
@@ -1046,8 +1164,7 @@ def main():
                             )
                         # Extract the same 2-D slice from the pre-computed 3-D
                         # TS mask.  Same slice_idx as the image â€” they must match.
-                        ts_mask_224 = zoom(ts_slice, (zh, zw), order=0)
-                        ts_mask_224 = (ts_mask_224 > 0.5).astype(np.uint8)
+                        ts_mask_224 = _resize_mask_224(ts_slice)
                         # Same resize logic as the HU mask: nearest-neighbour
                         # followed by re-binarisation.
                     else:
@@ -1071,8 +1188,11 @@ def main():
                     # -------------------------------------------------------
                     # Append the completed sample
                     # -------------------------------------------------------
+                    duplicate_image = (
+                        image_2d_224 if args.matched_2d_cache_path else image_224
+                    )
                     image_hash = hashlib.sha256(
-                        np.ascontiguousarray(image_224).tobytes()
+                        np.ascontiguousarray(duplicate_image).tobytes()
                     ).hexdigest()
                     if image_hash in seen_image_hashes:
                         print(
@@ -1097,7 +1217,7 @@ def main():
                     # during training; a single missing entry does not.
                     # In practice the window is microseconds and either outcome
                     # is extremely unlikely, but missing is safer than duplicating.
-                    samples.append({
+                    sample = {
                         "image":      image_224,     # normalised CT slice, float32 224Ã—224
                         "mask":       mask_224,      # HU lung mask, uint8 224Ã—224
                         "ts_mask":    ts_mask_224,   # TS lung mask, uint8 224Ã—224 (or None)
@@ -1111,7 +1231,21 @@ def main():
                         "crop_side_mm": args.nodule_crop_mm,
                         "crop_side_pixels": crop_side_pixels,
                         "crop_bounds_rc": crop_bounds,
-                    })
+                        "input_mode": "2.5d" if slice_offset_mm is not None else "2d",
+                    }
+                    if slice_25d_meta is not None:
+                        sample.update({
+                            "requested_offsets_mm": slice_25d_meta["requested_offsets_mm"],
+                            "actual_offsets_mm": slice_25d_meta["actual_offsets_mm"],
+                            "offset_error_mm": slice_25d_meta["offset_error_mm"],
+                            "slice_indices_25d": slice_25d_meta["indices"],
+                            "slice_z_middle_mm": slice_25d_meta["middle_z_mm"],
+                            "slice_offset_tolerance_mm": args.slice_offset_tolerance_mm,
+                            "masks_25d": masks_25d,
+                        })
+                        if args.matched_2d_cache_path:
+                            sample["_matched_2d_image"] = image_2d_224
+                    samples.append(sample)
                     seen_image_hashes.add(image_hash)
 
                 except Exception as e:
@@ -1145,12 +1279,38 @@ def main():
     # ------------------------------------------------------------------
     # Write the final cache file
     # ------------------------------------------------------------------
+    public_samples = []
+    matched_2d_samples = []
+    for sample in samples:
+        public_sample = {
+            key: value
+            for key, value in sample.items()
+            if key != "_matched_2d_image"
+        }
+        public_samples.append(public_sample)
+
+        if args.matched_2d_cache_path:
+            if "_matched_2d_image" not in sample:
+                raise RuntimeError(
+                    "Matched 2D cache was requested, but a sample is missing "
+                    "its central 2D image. Rebuild with --fresh."
+                )
+            matched_sample = dict(public_sample)
+            matched_sample["image"] = sample["_matched_2d_image"]
+            matched_sample["input_mode"] = "2d_matched_25d"
+            matched_2d_samples.append(matched_sample)
+
     with open(cache_out, "wb") as f:
-        pickle.dump(samples, f)
+        pickle.dump(public_samples, f)
     # Pickle serialises the entire list of sample dicts (including NumPy
     # arrays) to a single binary file.  pickle.HIGHEST_PROTOCOL is used
     # by default, which is the most compact and fastest format available
     # in the running Python version.
+
+    if args.matched_2d_cache_path:
+        with open(args.matched_2d_cache_path, "wb") as f:
+            pickle.dump(matched_2d_samples, f)
+        print(f"Saved matched 2D cache -> {args.matched_2d_cache_path}")
 
     # Keep checkpoint so a future run with a larger SAMPLE_SIZE can resume from here
     # (use --fresh to discard it and start over)
@@ -1163,6 +1323,8 @@ def main():
     ts_count = sum(1 for s in samples if s.get("ts_mask") is not None)
     print(f"\nDone. Cached {len(samples)} nodule slices to {cache_out}")
     print(f"  {n_ben} benign, {n_mal} malignant | TS masks: {ts_count}/{len(samples)}")
+    if slice_offset_mm is not None:
+        print(f"  Skipped for invalid 2.5D neighbours: {skipped_25d}")
     print(f"Now run baseline.py / train.py â€” pass --cache-path {cache_out} if not using default")
 
     _write_status(samples, cache_out, SAMPLE_SIZE, complete=True)
