@@ -102,7 +102,7 @@ from config import EPOCHS, BATCH_SIZE, LR, SEED, RESULTS_DIR, IMG_SIZE, TRAIN_CA
 #                   Used when upsampling Grad-CAM maps to match the input size.
 # TRAIN_CACHE_PATH: default path to the pre-built cache pickle (overridable via CLI).
 
-from dataset import LIDCDataset, load_nodules_hu, patient_split
+from dataset import LIDCDataset, load_nodules_hu, load_nodules_ts, patient_split
 # LIDCDataset    : torch Dataset wrapping the list of sample dicts produced by
 #                  build_cache.py.  Returns (image_tensor, mask_tensor, label) tuples.
 # load_nodules_hu: loads the cache pickle and filters to samples with HU masks.
@@ -584,6 +584,12 @@ def train_baseline():
     # directory so compare_all.py can compare them side-by-side.
     parser.add_argument("--cache-path", type=str, default=None,
                         help=f"Path to cache file (default: {TRAIN_CACHE_PATH})")
+    parser.add_argument(
+        "--mask-source",
+        choices=["hu", "ts"],
+        default="hu",
+        help="Use HU or TotalSegmentator lung masks for Grad-CAM alignment reporting.",
+    )
     # --cache-path lets you point at a non-default cache, e.g. a small test
     # cache (cache/cache_200.pkl) for quick smoke tests.
     parser.add_argument("--epochs", type=int, default=EPOCHS,
@@ -604,6 +610,10 @@ def train_baseline():
                         help="DataLoader workers. Keep 0 on Windows unless you know multiprocessing is stable.")
     parser.add_argument("--augment", action="store_true",
                         help="Apply conservative CT-safe augmentation to training samples only.")
+    parser.add_argument("--spectral-decoupling-lambda", type=float, default=0.0,
+                        help="Weight for spectral decoupling logit L2 penalty. 0 disables it.")
+    parser.add_argument("--spectral-decoupling-gamma", type=float, default=0.0,
+                        help="Target logit value for spectral decoupling penalty.")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -643,8 +653,11 @@ def train_baseline():
     cache_path = args.cache_path or TRAIN_CACHE_PATH
     # Resolve the cache path once here so it can be passed to _write_split_report
     # for inclusion in the split audit file.
-    nodules = load_nodules_hu(cache_path=cache_path)
-    # Loads the cache pickle and returns only samples that have a valid HU mask.
+    nodules = (
+        load_nodules_ts(cache_path=cache_path)
+        if args.mask_source == "ts"
+        else load_nodules_hu(cache_path=cache_path)
+    )
 
     train_nods, val_nods, test_nods = patient_split(nodules)
     # patient_split assigns whole patients to each split — if a patient has
@@ -727,6 +740,11 @@ def train_baseline():
             f.write("Augmentation details: training-only; validation/test unaugmented; unchanged p=0.25; hflip p=0.5; rotate +/-7 deg; translate +/-4%; scale 0.96-1.04; contrast 0.92-1.08; brightness +/-0.03; noise sigma 0.01 with p=0.25.\n")
             f.write("Attention penalty: none; this is a weighted-BCE classification-only baseline.\n")
         f.write(f"Loss: BCEWithLogitsLoss(pos_weight={pos_weight.item():.6f})\n")
+        f.write(f"Spectral decoupling lambda: {args.spectral_decoupling_lambda}\n")
+        f.write(f"Spectral decoupling gamma: {args.spectral_decoupling_gamma}\n")
+        if args.spectral_decoupling_lambda > 0:
+            f.write("Spectral decoupling formula: total_loss = weighted_BCE + lambda * mean((logit - gamma)^2).\n")
+            f.write("Purpose: discourage very large logits so the classifier does not become overconfident too early.\n")
         f.write(f"Train/val/test samples: {len(train_nods)}/{len(val_nods)}/{len(test_nods)}\n")
 
     # ------------------------------------------------------------------
@@ -743,7 +761,13 @@ def train_baseline():
         epoch_writer.writerow([
             "epoch",
             "train_bce",
+            "train_sd_raw",
+            "train_sd_weighted",
+            "train_total_loss",
             "val_bce",
+            "val_sd_raw",
+            "val_sd_weighted",
+            "val_total_loss",
             "val_auc",
             "val_accuracy_0p5",
             "val_f1_0p5",
@@ -757,7 +781,9 @@ def train_baseline():
             # train() re-enables dropout and switches batch norm back to
             # computing statistics from the current mini-batch (rather than
             # using running statistics as in eval mode).
-            train_loss_sum = 0.0
+            train_bce_sum = 0.0
+            train_sd_sum = 0.0
+            train_total_sum = 0.0
             train_seen = 0
             for batch_idx, (images, _masks, labels) in enumerate(train_loader):
                 # _masks: intentionally unused — baseline trains without any
@@ -775,10 +801,19 @@ def train_baseline():
                 # Forward pass: (B, 3, H, W) -> (B,) after squeezing the
                 # output feature dimension.
 
-                total_loss = criterion(logits, labels)
+                bce_loss = criterion(logits, labels)
                 # BCEWithLogitsLoss: compares per-sample logits to binary
                 # float labels {0.0, 1.0}.
-                train_loss_sum += total_loss.item() * images.size(0)
+                sd_loss = torch.mean((logits - args.spectral_decoupling_gamma) ** 2)
+                # Spectral decoupling penalises large raw logits. With gamma=0,
+                # it discourages early overconfidence without using masks,
+                # contours, Grad-CAM, or any extra labels.
+                weighted_sd = args.spectral_decoupling_lambda * sd_loss
+                total_loss = bce_loss + weighted_sd
+
+                train_bce_sum += bce_loss.item() * images.size(0)
+                train_sd_sum += sd_loss.item() * images.size(0)
+                train_total_sum += total_loss.item() * images.size(0)
                 train_seen += images.size(0)
 
                 total_loss.backward()
@@ -796,7 +831,9 @@ def train_baseline():
 
                 print(
                     f"Epoch {epoch:02d} | Batch {batch_idx:04d} | "
-                    f"BCE {total_loss.item():.4f}"
+                    f"BCE {bce_loss.item():.4f} | "
+                    f"SD {sd_loss.item():.4f} | "
+                    f"Total {total_loss.item():.4f}"
                 )
                 # :02d/:04d: zero-padding so log lines sort correctly when
                 # there are more than 9 epochs or 999 batches.
@@ -804,7 +841,9 @@ def train_baseline():
             # ── Validation phase ─────────────────────────────────────────
             model.eval()
             all_preds, all_labels = [], []
-            val_loss_sum = 0.0
+            val_bce_sum = 0.0
+            val_sd_sum = 0.0
+            val_total_sum = 0.0
             val_seen = 0
             with torch.no_grad():
                 # no_grad() prevents building a gradient graph during
@@ -813,7 +852,12 @@ def train_baseline():
                     images = images.to(device)
                     labels_device = labels.to(device)
                     logits = model(images).squeeze(1)
-                    val_loss_sum += criterion(logits, labels_device).item() * images.size(0)
+                    val_bce = criterion(logits, labels_device)
+                    val_sd = torch.mean((logits - args.spectral_decoupling_gamma) ** 2)
+                    val_total = val_bce + args.spectral_decoupling_lambda * val_sd
+                    val_bce_sum += val_bce.item() * images.size(0)
+                    val_sd_sum += val_sd.item() * images.size(0)
+                    val_total_sum += val_total.item() * images.size(0)
                     val_seen += images.size(0)
                     probs = torch.sigmoid(logits).cpu().numpy()
                     all_preds.extend(probs.tolist())
@@ -825,8 +869,14 @@ def train_baseline():
 
             preds_bin = [1 if p >= 0.5 else 0 for p in all_preds]
             acc = sum(p == l for p, l in zip(preds_bin, all_labels)) / max(len(all_labels), 1)
-            train_loss_mean = train_loss_sum / max(train_seen, 1)
-            val_loss_mean = val_loss_sum / max(val_seen, 1)
+            train_bce_mean = train_bce_sum / max(train_seen, 1)
+            train_sd_mean = train_sd_sum / max(train_seen, 1)
+            train_total_mean = train_total_sum / max(train_seen, 1)
+            val_bce_mean = val_bce_sum / max(val_seen, 1)
+            val_sd_mean = val_sd_sum / max(val_seen, 1)
+            val_total_mean = val_total_sum / max(val_seen, 1)
+            train_sd_weighted = args.spectral_decoupling_lambda * train_sd_mean
+            val_sd_weighted = args.spectral_decoupling_lambda * val_sd_mean
             try:
                 auc = roc_auc_score(all_labels, all_preds)
             except ValueError:
@@ -838,8 +888,10 @@ def train_baseline():
 
             val_metrics = _classification_metrics(all_labels, all_preds)
             log_line = (
-                f"Epoch {epoch:02d} | Train BCE {train_loss_mean:.4f} | "
-                f"Val BCE {val_loss_mean:.4f} | Val AUC {auc:.4f} | "
+                f"Epoch {epoch:02d} | Train BCE {train_bce_mean:.4f} | "
+                f"Train SD {train_sd_weighted:.4f} | Train total {train_total_mean:.4f} | "
+                f"Val BCE {val_bce_mean:.4f} | Val SD {val_sd_weighted:.4f} | "
+                f"Val total {val_total_mean:.4f} | Val AUC {auc:.4f} | "
                 f"Val Acc {acc:.4f} | Val F1 {val_metrics['f1']:.4f} | "
                 f"Val Sens {val_metrics['sensitivity']:.4f} | "
                 f"Val Spec {val_metrics['specificity']:.4f}\n"
@@ -847,8 +899,14 @@ def train_baseline():
             log_f.write(log_line)
             epoch_writer.writerow([
                 epoch,
-                f"{train_loss_mean:.8f}",
-                f"{val_loss_mean:.8f}",
+                f"{train_bce_mean:.8f}",
+                f"{train_sd_mean:.8f}",
+                f"{train_sd_weighted:.8f}",
+                f"{train_total_mean:.8f}",
+                f"{val_bce_mean:.8f}",
+                f"{val_sd_mean:.8f}",
+                f"{val_sd_weighted:.8f}",
+                f"{val_total_mean:.8f}",
                 f"{auc:.8f}",
                 f"{acc:.8f}",
                 f"{val_metrics['f1']:.8f}",

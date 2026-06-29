@@ -21,7 +21,7 @@ from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
 from torch.utils.data import DataLoader
 
 from config import BATCH_SIZE, EPOCHS, LR, RESULTS_DIR, SEED, TRAIN_CACHE_PATH
-from dataset import LIDCDataset, load_nodules_hu, patient_split
+from dataset import LIDCDataset, load_nodules_hu, load_nodules_ts, patient_split
 from model import NoduleClassifier
 
 
@@ -278,7 +278,7 @@ def _train_trial(alpha, delta, train_nods, val_nods, device, args, trial_dir):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.training_seed)
 
-    train_ds = LIDCDataset(train_nods)
+    train_ds = LIDCDataset(train_nods, augment=args.augment)
     val_ds = LIDCDataset(val_nods)
     generator = torch.Generator().manual_seed(args.training_seed)
     train_loader = DataLoader(
@@ -421,6 +421,7 @@ def _write_info(run_dir, args, device, train, val, test):
         "=== ZHANG-INSPIRED ADAPTIVE CSL ALPHA SEARCH ===",
         f"Cache: {os.path.abspath(args.cache_path)}",
         f"Device: {device}",
+        f"Lung mask source: {args.mask_source}",
         f"Patient split seed: {SEED}",
         f"Training seed: {args.training_seed}",
         f"Alphas: {args.alphas}",
@@ -432,7 +433,15 @@ def _write_info(run_dir, args, device, train, val, test):
         f"Freeze through: {args.freeze_through}",
         f"Confidence mode: {args.confidence_mode}",
         f"Minimum attention weight: {args.min_attention_weight}",
-        "Augmentation: none",
+        f"Training augmentation: {args.augment}",
+        (
+            "Augmentation details: training-only; validation/test/alignment unaugmented; "
+            "unchanged p=0.25; hflip p=0.5; rotate +/-7 deg; translate +/-4%; "
+            "scale 0.96-1.04; contrast 0.92-1.08; brightness +/-0.03; "
+            "noise sigma 0.01 with p=0.25."
+            if args.augment
+            else "Augmentation details: none."
+        ),
         "Explanation: predicted-class Grad-CAM (Zhang used CAM)",
         "Supervision: fixed binary HU lung mask (Zhang used learned nodule SEM)",
         "Loss: BCE + alpha * detached-confidence * margin",
@@ -508,6 +517,7 @@ def main():
     parser = argparse.ArgumentParser(description="Zhang-inspired adaptive CSL alpha search.")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--cache-path", default=TRAIN_CACHE_PATH)
+    parser.add_argument("--mask-source", choices=["hu", "ts"], default="hu")
     parser.add_argument("--alphas", type=_parse_alphas, default=DEFAULT_ALPHAS)
     parser.add_argument("--delta", type=float, default=DEFAULT_DELTA)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
@@ -549,6 +559,11 @@ def main():
             "(default: 0.25)."
         ),
     )
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="Apply conservative CT-safe augmentation to training samples only.",
+    )
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1:
         parser.error("epochs and batch-size must be positive")
@@ -568,7 +583,11 @@ def main():
     run_id = args.run_id or datetime.now().strftime("adaptive_grid_%Y%m%d_%H%M%S")
     run_dir = os.path.join(RESULTS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=False)
-    nodules = load_nodules_hu(args.cache_path)
+    nodules = (
+        load_nodules_ts(args.cache_path)
+        if args.mask_source == "ts"
+        else load_nodules_hu(args.cache_path)
+    )
     train, val, test = patient_split(nodules)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _write_info(run_dir, args, device, train, val, test)

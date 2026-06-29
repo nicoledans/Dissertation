@@ -12,6 +12,10 @@ import pickle
 from collections import defaultdict
 
 import numpy as np
+
+if not hasattr(np, "int"):
+    np.int = int
+
 import pylidc as pl
 from scipy.ndimage import zoom
 

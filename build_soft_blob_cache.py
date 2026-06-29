@@ -11,12 +11,16 @@ import pickle
 from collections import defaultdict
 
 import numpy as np
+
+if not hasattr(np, "int"):
+    np.int = int
+
 import pylidc as pl
 from scipy.ndimage import zoom
 
 from config import TRAIN_CACHE_PATH
+from lidc_matching import _eligible_candidates, _image_hash
 from soft_blob_generator import soft_blob_maps
-from visualize_nodule_gradcam import _eligible_candidates, _image_hash
 
 
 def _resize_mask_to_raw(mask_224, raw_shape):

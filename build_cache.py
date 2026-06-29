@@ -79,6 +79,11 @@ from scipy.ndimage import (
     #   ensuring nodules that sit at the pleural edge are not clipped.
     binary_dilation,
 
+    # binary_closing: closes narrow gaps in a binary region before hole filling.
+    #   Used in the HU mask to connect dense nodules/vessels back into the
+    #   air-derived lung component when thresholding leaves small openings.
+    binary_closing,
+
     # binary_fill_holes: fills enclosed background regions inside a binary mask.
     #   Used in the TS pipeline to close the inter-lobe gaps that TotalSegmentator
     #   sometimes leaves between adjacent lung lobes.
@@ -167,6 +172,15 @@ MASK_DILATION = _CFG_MASK_DILATION
 # ~3 pixels in every direction.  This matters because nodules at the pleural
 # surface (where the lung meets the chest wall) may be partially outside the
 # raw segmented region; the dilation ensures they are included.
+
+HU_MASK_CLOSING_RADIUS = 15
+# HU thresholding finds mostly air, so solid nodules and vessels can appear as
+# holes or narrow cut-outs inside the lung.  Closing before hole filling bridges
+# small gaps so the final HU mask better approximates the whole lung region.
+
+HU_MASK_FINAL_DILATION_RADIUS = 4
+# Slightly larger than the default dilation to catch pleural-edge nodules that
+# sit just outside the air-derived mask boundary after closing/filling.
 
 MALIGNANCY_THRESHOLD = _CFG_MALIGNANCY_THRESHOLD
 # The LIDC dataset records each radiologist's malignancy rating on a scale
@@ -290,7 +304,12 @@ def _get_lung_mask(slice_2d):
     for lung in lungs[1:]:
         combined |= lung
 
-    return binary_dilation(combined, structure=morpho_disk(MASK_DILATION)).astype(np.uint8)
+    combined = binary_closing(combined, structure=morpho_disk(HU_MASK_CLOSING_RADIUS))
+    combined = binary_fill_holes(combined)
+    return binary_dilation(
+        combined,
+        structure=morpho_disk(HU_MASK_FINAL_DILATION_RADIUS),
+    ).astype(np.uint8)
 
 
 

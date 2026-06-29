@@ -7,6 +7,10 @@ import pickle
 from collections import defaultdict
 
 import numpy as np
+
+if not hasattr(np, "int"):
+    np.int = int
+
 import pylidc as pl
 import torch
 import torch.nn.functional as F

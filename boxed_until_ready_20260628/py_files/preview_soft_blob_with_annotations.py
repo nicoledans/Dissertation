@@ -14,6 +14,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+if not hasattr(np, "int"):
+    np.int = int
+
 import pylidc as pl
 from scipy.ndimage import zoom
 

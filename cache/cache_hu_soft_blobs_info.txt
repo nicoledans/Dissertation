@@ -1,0 +1,17 @@
+Soft blob map cache
+Source cache: .\cache\cache_hu_fixed.pkl
+Output cache: .\cache\cache_hu_soft_blobs.pkl
+Mask key used for lung restriction: mask
+Contours are not used for map generation.
+Generated maps: 1575 / 1575
+Missing maps: 0
+Lung dilation: 3 px at native resolution
+Diameter scale: 3-30 mm
+Vessel suppression cap: 0.3
+Gaussian blur sigma: 2 px
+2.5D persistence weight: 0.25
+Mean soft map value: 0.0452
+Mean non-zero soft map area: 22.46%
+Mean high-response area >=0.50: 2.48%
+
+Missing samples:

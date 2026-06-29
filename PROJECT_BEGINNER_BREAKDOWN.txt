@@ -1,0 +1,1149 @@
+# Project Beginner Breakdown
+
+This document explains the project in beginner-friendly terms. It is intended
+for project handover, supervisor updates, and helping a coding agent or person
+understand what was done without reading the Python code.
+
+The project uses the LIDC-IDRI lung CT dataset to classify lung nodules as
+benign or malignant. It also studies whether Grad-CAM attention can be guided
+toward medically sensible regions, such as the lungs or nodule-like structures.
+
+The most important finding so far is:
+
+- Mild CT-safe data augmentation gave the best AUC.
+- Grad-CAM attention losses often improved attention alignment but hurt AUC.
+- Zhang/adaptive Grad-CAM loss gave the best attention-loss compromise.
+- Soft blob maps worked well as annotation-free nodule-like maps in audit, but
+  using them in training has not yet reliably improved AUC.
+
+
+# 1. Project Overview
+
+- Main task:
+  - classify LIDC-IDRI lung nodules as benign or malignant.
+  - use CT image slices from the LIDC-IDRI dataset.
+  - use radiologist malignancy suspicion ratings as the source of labels.
+
+- Main model:
+  - ResNet-50 based binary classifier.
+  - output is one malignancy score.
+  - sigmoid(score) gives probability of malignant.
+
+- Main research question:
+  - can the model classify well while also looking in medically reasonable
+    places?
+
+- Two kinds of evaluation:
+  - classification performance:
+    - AUC.
+    - accuracy.
+    - F1.
+    - sensitivity.
+    - specificity.
+  - attention behaviour:
+    - percentage of Grad-CAM inside the lung mask.
+    - overlap between Grad-CAM and soft blob maps.
+    - optional audit against radiologist nodule contours.
+
+- Main tension found:
+  - making Grad-CAM look better does not automatically improve classification.
+  - stronger attention penalties often made attention better but AUC worse.
+  - data augmentation improved AUC more reliably than attention losses.
+
+
+# 2. Beginner Glossary
+
+- CT scan:
+  - a medical image showing slices through the body.
+  - lung CT scans are usually 3D volumes made of many 2D slices.
+
+- DICOM:
+  - the standard medical image file format used for raw CT images.
+
+- Hounsfield Unit, or HU:
+  - the intensity scale used in CT.
+  - air is around -1000 HU.
+  - water is around 0 HU.
+  - dense bone can be several hundred HU or higher.
+
+- LIDC-IDRI:
+  - public lung CT dataset.
+  - contains CT scans, radiologist nodule annotations, and malignancy suspicion
+    ratings.
+
+- Nodule:
+  - a small abnormal spot or lesion in the lung.
+  - in this project, each sample is based on one accepted nodule.
+
+- Annotation:
+  - information added by a radiologist.
+  - in LIDC this can include where the nodule is and a malignancy suspicion
+    score.
+
+- Annotation-free:
+  - no radiologist contour is used during training or loss construction.
+  - image-derived masks, such as HU lung masks or soft blob maps, are still
+    annotation-free because they come from the CT image itself.
+
+- Radiologist contour / lesion contour:
+  - the radiologist-drawn outline of the nodule.
+  - this is the closest thing to "where the nodule is".
+  - in annotation-free experiments, contours are used only for audit and
+    visualization, not training.
+
+- Lung mask:
+  - a binary image:
+    - 1 means inside lung.
+    - 0 means outside lung.
+
+- HU lung mask:
+  - lung mask created automatically from CT intensity values.
+  - it does not use radiologist nodule contours.
+
+- TotalSegmentator mask:
+  - lung mask created by a pretrained 3D anatomical segmentation model.
+  - generally more anatomical than the HU threshold mask but slower to create.
+
+- Soft blob map:
+  - continuous map from 0 to 1.
+  - higher values mean "this area looks more nodule-like".
+  - it is image-derived, not a true nodule label.
+
+- Grad-CAM:
+  - heatmap that shows which image regions supported the model prediction.
+  - red/yellow usually means stronger attention.
+  - blue/low values usually mean weaker attention.
+
+- Logit:
+  - the raw model output before sigmoid.
+  - positive logit means the model leans malignant.
+  - negative logit means the model leans benign.
+
+- Sigmoid:
+  - function that converts a logit into a probability between 0 and 1.
+  - sigmoid(logit) = probability of malignant.
+
+- BCE loss:
+  - binary cross-entropy loss.
+  - measures how wrong the model is for benign/malignant classification.
+
+- Weighted BCE:
+  - BCE with extra weight for the minority class.
+  - used because benign and malignant samples are not perfectly balanced.
+
+- AUC:
+  - area under ROC curve.
+  - threshold-free ranking metric.
+  - higher AUC means malignant samples are generally ranked above benign samples.
+
+- Accuracy:
+  - percentage of predictions correct at threshold 0.5.
+
+- F1:
+  - balance between precision and recall for the malignant class.
+
+- Sensitivity:
+  - true positive rate.
+  - percentage of malignant nodules correctly predicted malignant.
+
+- Specificity:
+  - true negative rate.
+  - percentage of benign nodules correctly predicted benign.
+
+- Validation set:
+  - data used during training to choose the best checkpoint.
+  - not used for gradient updates.
+
+- Test set:
+  - held-out final evaluation data.
+  - should only be used after model selection.
+
+- Checkpoint:
+  - saved model weights.
+  - usually the best validation AUC model.
+
+- Patient-level split:
+  - all samples from one patient stay in only one split.
+  - prevents leakage between train, validation, and test.
+
+
+# 3. Dataset And Cache Pipeline
+
+The raw LIDC-IDRI dataset is not directly ready for training. The script
+`build_cache.py` converts it into easier-to-load cache files.
+
+## What Raw LIDC Contains
+
+- Full 3D CT scans.
+- Many DICOM files per scan.
+- Multiple radiologist annotations.
+- Malignancy suspicion ratings from 1 to 5.
+- Different scan resolutions and slice spacings.
+- Raw CT values in Hounsfield Units.
+
+## Cache-Building Steps
+
+1. Load all LIDC scans.
+
+2. Shuffle scans with a fixed seed:
+   - seed = 42.
+   - this makes the cache reproducible.
+
+3. Load one 3D CT volume at a time.
+
+4. Group radiologist annotations:
+   - `scan.cluster_annotations()` groups annotations that refer to the same
+     physical nodule.
+   - this avoids treating one physical nodule as multiple samples.
+
+5. Accept only nodules with enough radiologist agreement:
+   - require at least 2 radiologists.
+   - current setting: `MIN_RADIOLOGISTS = 2`.
+
+6. Convert malignancy scores to binary labels:
+   - each radiologist gives a score from 1 to 5.
+   - average the scores for the grouped nodule.
+   - average < 3 means benign, label 0.
+   - average > 3 means malignant, label 1.
+   - average = 3 means ambiguous, reject the sample.
+
+7. Pick one 2D representative slice:
+   - collect all annotated slice indices.
+   - sort them.
+   - choose the middle annotated slice.
+   - this usually shows the nodule near its central extent.
+
+8. Create the HU lung mask:
+   - uses CT intensity thresholding and connected components.
+   - does not use radiologist nodule contours.
+
+9. Optionally create a TotalSegmentator lung mask:
+   - runs on the full 3D CT volume.
+   - combines lung lobes into one lung mask.
+
+10. Optionally crop around the nodule:
+    - available in code, but main valid HU cache uses full slices.
+
+11. Clip and normalize CT image:
+    - clip HU to [-1000, 400].
+    - scale to [0, 1].
+    - resize to 224 x 224.
+
+12. Resize masks:
+    - image uses bilinear interpolation.
+    - masks use nearest-neighbour interpolation.
+    - masks are binarized after resizing.
+
+13. Reject invalid samples:
+    - empty lung mask.
+    - failed processing.
+    - exact duplicate image, depending on cache version.
+
+14. Save sample metadata:
+    - image.
+    - HU mask.
+    - optional TS mask.
+    - label.
+    - patient ID.
+    - scan ID.
+    - nodule ID.
+    - slice index.
+    - nodule center.
+    - crop mode and crop bounds if applicable.
+
+15. Save checkpoint while building:
+    - cache building can take a long time.
+    - checkpoint allows resume after interruption.
+    - training should use completed cache files, not checkpoint files.
+
+
+# 4. Cache Files
+
+The project uses several cache files. The most important one is
+`cache/cache_hu_fixed.pkl`.
+
+| Cache | Meaning | Used For |
+|---|---|---|
+| `cache/cache_hu_fixed.pkl` | Main 2D full-slice HU cache with automatic HU lung masks | Baseline, strict HU penalty, Zhang, improved Zhang, augmentation |
+| `cache/cache_hu_soft_blobs.pkl` | HU cache plus soft blob maps | Blob attention experiments, soft blob input, soft blob audits |
+| `cache/cache_hu_25d_2p5mm.pkl` | 2.5D cache with lower/middle/upper slices around the nodule | 2.5D experiments |
+| `cache/cache_hu_2d_matched_25d_2p5mm.pkl` | 2D cache matched to the eligible 2.5D subset | Fair 2D vs 2.5D comparison |
+| `cache/cache_ts_checkpoint.pkl` | Partial TotalSegmentator checkpoint | Not a final training dataset |
+| `cache/cache_hu_25d_2p5mm_masks.pkl` | 2.5D/mask cache variant | Experimental mask-related 2.5D work |
+
+Known cache details:
+
+- `cache/cache_hu_fixed.pkl`
+  - main valid HU dataset.
+  - 1575 accepted samples.
+  - full 2D axial slices.
+  - no TotalSegmentator mask in the main HU-only version.
+
+- `cache/cache_hu_soft_blobs.pkl`
+  - generated from `cache/cache_hu_fixed.pkl`.
+  - 1575 / 1575 samples received soft blob maps.
+
+- `cache/cache_hu_25d_2p5mm.pkl`
+  - stores three slices:
+    - one below the selected nodule slice.
+    - the selected middle slice.
+    - one above the selected slice.
+  - intended offset: +/- 2.5 mm.
+  - uses nearest available native slice within tolerance.
+
+- `cache/cache_ts_checkpoint.pkl`
+  - only a checkpoint.
+  - not a completed training cache.
+
+- Archived or less-needed results are stored in:
+  - `results/DONT NEED RESULTS`.
+
+
+# 5. HU Lung Mask Creation
+
+The HU lung mask is created from CT intensity values. It does not use
+radiologist contours.
+
+Step-by-step:
+
+1. Start with the raw CT slice in Hounsfield Units.
+
+2. Use threshold:
+   - pixels below -500 HU are treated as air-like.
+   - pixels at or above -500 HU are treated as body-like.
+
+3. Find the largest connected body-like component:
+   - this is treated as the patient body.
+   - helps remove scanner/background air.
+
+4. Fill holes inside the patient body:
+   - creates a body envelope.
+
+5. Keep air-like pixels inside that body envelope:
+   - these are possible lung air regions.
+
+6. Remove air connected to the image border:
+   - border air is usually outside the patient.
+
+7. Find connected internal air regions:
+   - keep up to the two largest components.
+   - these usually correspond to the two lungs.
+
+8. Dilate the mask:
+   - current dilation is 3 pixels.
+   - helps include boundary regions and pleural-adjacent nodules.
+
+9. Resize to 224 x 224:
+   - use nearest-neighbour interpolation.
+   - re-binarize to 0/1.
+
+Why this is weak guidance:
+
+- It is automatic and fast.
+- It is annotation-free.
+- It can miss dense lung tissue.
+- Solid nodules may appear as holes or gaps because they are not air-like.
+- Pleural or boundary nodules may sit partly outside the mask.
+- It is not true anatomical ground truth.
+
+
+# 6. TotalSegmentator Mask
+
+TotalSegmentator is a pretrained 3D segmentation model.
+
+How it is used:
+
+- Run once on the complete 3D CT scan.
+- Request only lung lobe structures:
+  - left upper lobe.
+  - left lower lobe.
+  - right upper lobe.
+  - right middle lobe.
+  - right lower lobe.
+- Combine the lobes into one lung mask.
+- Fill holes.
+- Dilate the combined mask.
+- Extract the same selected 2D slice as the CT image.
+
+Why it matters:
+
+- It is more anatomical than simple HU thresholding.
+- It can include denser lung regions better.
+- It is much slower.
+- The main completed comparisons mostly used HU masks.
+
+
+# 7. Soft Blob Map Creation
+
+The soft blob map is an annotation-free nodule-like map.
+
+It is not a radiologist contour and not a cancer label.
+
+Purpose:
+
+- identify areas that look like possible pulmonary nodules.
+- use image physics and shape cues.
+- provide a weak prior for attention experiments.
+- audit whether image-derived maps overlap radiologist contours.
+
+Inputs:
+
+- raw HU slice.
+- lung mask.
+- pixel spacing in millimetres.
+- optional adjacent slices.
+
+Main steps:
+
+1. Restrict search to lung region:
+   - use HU lung mask.
+   - fill holes.
+   - dilate lung by 3 pixels.
+
+2. Clip and normalize CT image:
+   - clip HU to [-1000, 400].
+   - scale to [0, 1].
+
+3. Compute Laplacian-of-Gaussian response:
+   - detects bright blob-like structures at multiple physical scales.
+   - scale range corresponds to 3-30 mm diameter.
+
+4. Compute Hessian blobness and vesselness:
+   - blobness highlights compact rounded structures.
+   - vesselness highlights line-like structures.
+
+5. Compute local contrast:
+   - compares each area with a blurred local background.
+   - nodules often stand out against nearby lung tissue.
+
+6. Compute texture:
+   - local variation around the pixel.
+   - helps subsolid or ground-glass-like candidates.
+
+7. Apply HU gates:
+   - solid-like gate:
+     - roughly -550 to +350 HU.
+   - subsolid-like gate:
+     - roughly -900 to -120 HU.
+   - gates are soft, not hard binary thresholds.
+
+8. Suppress vessel-like structures:
+   - vessel suppression cap is 0.3.
+   - avoids overemphasizing long thin vessels.
+
+9. Apply compactness weighting:
+   - compact connected components get slightly higher weight.
+
+10. Combine maps:
+    - create solid-like map.
+    - create subsolid-like map.
+    - final soft blob map is the maximum of the two.
+
+11. Optional 2.5D persistence:
+    - adjacent slices can boost structures that persist across slices.
+    - persistence weight is 0.25.
+
+12. Blur and normalize:
+    - Gaussian blur sigma = 2 pixels.
+    - final values are normalized to [0, 1].
+
+Important parameters:
+
+- diameter scale: 3-30 mm.
+- lung dilation: 3 pixels.
+- vessel suppression: 0.3.
+- blur sigma: 2 pixels.
+- persistence weight: 0.25.
+
+Audit results:
+
+- maps generated for 1575 / 1575 samples.
+- mean contour area touched by non-zero blob response: 97.32%.
+- median contour area touched by non-zero blob response: 100.00%.
+- mean contour area touched by top-10% blob response: 82.00%.
+- median contour area touched by top-10% blob response: 93.33%.
+- centre inclusion in high response: 1547 / 1575 = 98.22%.
+- mean blob value inside contour: 0.7530.
+- mean blob value outside contour: 0.1830.
+- mean inside-minus-outside blob value: 0.5700.
+
+Important interpretation:
+
+- This map is good at touching radiologist nodule contours in audit.
+- It is not a malignancy map.
+- It can highlight benign nodules, vessels, scars, dense tissue, or other
+  blob-like structures.
+- Radiologist contours were used only to evaluate the map after generation.
+- Radiologist contours were not used to create the map.
+
+
+# 8. Model Architecture
+
+The main model is called `NoduleClassifier`.
+
+Backbone:
+
+- ResNet-50.
+- pretrained on ImageNet.
+- ImageNet pretraining gives useful low-level edge and texture filters.
+
+Input:
+
+- 3 channels.
+- For ordinary 2D CT:
+  - the same 2D CT slice is repeated into 3 channels.
+- For 2.5D CT:
+  - channel 0 = lower nearby slice.
+  - channel 1 = middle selected slice.
+  - channel 2 = upper nearby slice.
+- For soft blob input experiment:
+  - channel 0 = CT image.
+  - channel 1 = soft blob map.
+  - channel 2 = lung mask.
+
+Classifier head:
+
+- original ImageNet 1000-class head is removed.
+- replacement head:
+  - Dropout(0.5).
+  - Linear(2048, 256).
+  - ReLU.
+  - Linear(256, 1).
+
+Output:
+
+- one logit per image.
+- positive logit means leaning malignant.
+- negative logit means leaning benign.
+- sigmoid(logit) = probability of malignant.
+
+Grad-CAM hooks:
+
+- hooks are attached to ResNet `layer4`.
+- forward hook saves feature maps.
+- backward hook saves gradients.
+- these are used to compute Grad-CAM heatmaps.
+
+Class score for Grad-CAM:
+
+- malignant class:
+  - use positive logit.
+- benign class:
+  - use negative logit.
+- this allows Grad-CAM to explain either the malignant or benign decision.
+
+
+# 9. Training And Evaluation Flow
+
+A typical training run does this:
+
+1. Load a completed cache file.
+
+2. Validate that each sample has:
+   - image.
+   - mask.
+   - label.
+   - patient ID.
+
+3. Split by patient:
+   - 70% train.
+   - 15% validation.
+   - 15% test.
+
+4. Build PyTorch datasets and DataLoaders.
+
+5. Compute class imbalance weight:
+   - `pos_weight = number of benign train samples / number of malignant train samples`.
+
+6. Build ResNet-50 classifier.
+
+7. Train for several epochs:
+   - forward pass.
+   - compute BCE.
+   - optionally compute Grad-CAM attention penalty.
+   - combine losses.
+   - backpropagate.
+   - update model.
+
+8. Validate each epoch:
+   - compute probabilities.
+   - compute AUC, accuracy, F1, sensitivity, specificity.
+   - save checkpoint if validation AUC improves.
+
+9. Reload best validation AUC checkpoint.
+
+10. Evaluate on held-out test set:
+    - compute test metrics.
+    - compute Grad-CAM attention metrics.
+
+11. Save outputs:
+    - result TXT.
+    - epoch CSV.
+    - prediction CSV.
+    - model checkpoint.
+    - Grad-CAM PNG examples.
+
+
+# 10. Augmentation Setup
+
+Augmentation is used only during training.
+
+Validation and test data are always unaugmented.
+
+Augmentation details:
+
+- 25% probability:
+  - return the original image unchanged.
+
+- Otherwise apply mild transforms:
+  - horizontal flip with probability 0.5.
+  - rotation between -7 and +7 degrees.
+  - translation up to 4%.
+  - scale from 0.96 to 1.04.
+  - contrast from 0.92 to 1.08.
+  - brightness shift from -0.03 to +0.03.
+  - Gaussian noise with sigma 0.01 and probability 0.25.
+
+Interpolation:
+
+- CT image:
+  - bilinear interpolation.
+- masks:
+  - nearest-neighbour interpolation.
+  - re-binarized after augmentation.
+
+Why this is medically reasonable:
+
+- changes are mild.
+- no vertical flips.
+- no large crops.
+- no extreme contrast changes.
+- validation/test remain real original images.
+
+
+# 11. Loss Functions
+
+This section explains each loss in plain English first, then formula.
+
+
+## 11.1 Baseline BCE
+
+Plain English:
+
+- Train only the benign/malignant classifier.
+- No mask.
+- No Grad-CAM penalty.
+- No attention guidance.
+
+Formula:
+
+```text
+loss = weighted_BCE(logit, label)
+```
+
+Meaning:
+
+- label 0 = benign.
+- label 1 = malignant.
+- weighted BCE gives extra importance to malignant cases if they are fewer.
+
+
+## 11.2 Strict HU Grad-CAM Penalty
+
+Plain English:
+
+- Train classification.
+- Also punish Grad-CAM attention outside the HU lung mask.
+
+Formula:
+
+```text
+A = GradCAM heatmap
+A_mass = A / (sum(A) + eps)
+outside_penalty = sum(A_mass * (1 - lung_mask))
+
+loss = weighted_BCE + alpha * outside_penalty
+```
+
+Used value:
+
+```text
+alpha = 0.15
+```
+
+Result:
+
+- AUC dropped.
+- lung attention improved strongly.
+
+Interpretation:
+
+- strong attention control worked for attention.
+- it hurt classification.
+
+
+## 11.3 Zhang / Adaptive Grad-CAM Margin
+
+Plain English:
+
+- Instead of punishing all outside-lung attention mass, compare average
+  Grad-CAM intensity inside and outside the lung.
+- Only punish if outside attention is stronger than inside attention by a
+  margin.
+
+Formula:
+
+```text
+inside_mean = mean GradCAM value inside lung
+outside_mean = mean GradCAM value outside lung
+margin = relu(outside_mean - inside_mean + delta)
+
+loss = weighted_BCE + alpha * confidence_weight * margin
+```
+
+Used:
+
+```text
+delta = 0.1
+```
+
+Why it is softer:
+
+- it does not require all heatmap mass to be inside lung.
+- it only asks inside-lung attention to be stronger on average.
+
+Result:
+
+- AUC stayed close to baseline.
+- Grad-CAM inside lung improved compared with baseline.
+
+
+## 11.4 Improved Zhang Correct-Class Confidence
+
+Plain English:
+
+- Same Zhang margin idea.
+- But the confidence weight depends on probability of the correct class.
+
+Formula:
+
+```text
+p = sigmoid(logit)
+
+if label = 1:
+    correct_prob = p
+else:
+    correct_prob = 1 - p
+
+attention_weight = 0.25 + 0.75 * correct_prob
+
+loss = weighted_BCE + alpha * attention_weight * margin
+```
+
+Important detail:
+
+- confidence is detached.
+- this means the model cannot game the confidence term directly.
+- confidence only controls how much attention pressure is applied.
+
+Result:
+
+- slight improvement over old Zhang.
+- best attention-loss compromise.
+
+
+## 11.5 Blob-Only Grad-CAM Loss
+
+Plain English:
+
+- Train classification.
+- Also gently encourage Grad-CAM to overlap soft blob/nodule-like regions.
+- No lung outside penalty in the best blob-only version.
+
+Formula:
+
+```text
+A = GradCAM heatmap
+A_mass = A / (sum(A) + eps)
+blob_overlap = sum(A_mass * soft_blob_map)
+blob_loss = relu(0.10 - blob_overlap)
+
+loss = weighted_BCE + beta * blob_loss
+```
+
+Used:
+
+```text
+target_overlap = 0.10
+beta = 0.03
+```
+
+Meaning:
+
+- the model is gently encouraged to place at least 10% of Grad-CAM mass on
+  nodule-like regions.
+
+Result:
+
+- best blob-loss run had AUC 0.6864.
+- high sensitivity.
+- result was unstable and did not repeat as strongly.
+
+
+## 11.6 Outside + Blob Reward
+
+Plain English:
+
+- Punish Grad-CAM outside lung.
+- Reward Grad-CAM overlap with soft blob map.
+
+Formula:
+
+```text
+outside_mass = sum(A_mass * (1 - lung_mask))
+blob_overlap = sum(A_mass * soft_blob_map)
+
+loss = weighted_BCE + alpha * outside_mass - beta * blob_overlap
+```
+
+Used:
+
+```text
+alpha = 0.03
+beta = 0.003
+```
+
+Result:
+
+- improved lung/blob attention.
+- hurt AUC.
+
+
+## 11.7 Outside + Blob Hinge Curriculum
+
+Plain English:
+
+- Start by cleaning up outside-lung attention.
+- Then introduce blob guidance.
+
+Formula:
+
+```text
+loss = weighted_BCE
+     + alpha * outside_lung_mass
+     + beta * relu(0.10 - blob_overlap)
+```
+
+Schedule:
+
+```text
+Epochs 1-5:
+    alpha = 0.03
+    beta = 0
+
+Epochs 6-10:
+    alpha = 0.02
+    beta = 0.01
+
+Epochs 11-20:
+    alpha = 0.01
+    beta = 0.03
+```
+
+Result:
+
+- attention improved.
+- AUC dropped.
+
+
+## 11.8 Spatial Dominance Curriculum
+
+Plain English:
+
+- Try forcing Grad-CAM into lung first.
+- Then gradually return control to classification BCE.
+
+Formula:
+
+```text
+loss = lambda_spatial * outside_lung_mass
+     + lambda_BCE * weighted_BCE
+```
+
+Original idea:
+
+```text
+Phase 1:
+    lambda_spatial = 0.85
+    lambda_BCE = 0.15
+
+Phase 2:
+    reduce spatial weight
+    increase BCE weight
+
+Phase 3:
+    mostly BCE
+```
+
+Results:
+
+- 90% inside-lung trigger never happened.
+- 75% trigger did happen.
+- attention improved strongly.
+- AUC remained poor.
+
+Interpretation:
+
+- the model became good at satisfying the attention rule.
+- classification was damaged.
+- strong spatial dominance was too aggressive.
+
+
+## 11.9 Soft Blob Input
+
+Plain English:
+
+- Instead of using soft blob map in the loss, feed it directly into the model.
+
+Input:
+
+```text
+channel 0 = CT image
+channel 1 = soft_blob_map
+channel 2 = lung_mask
+```
+
+Loss:
+
+```text
+loss = weighted_BCE
+```
+
+Result:
+
+- did not improve AUC.
+- attention improved slightly.
+
+
+## 11.10 Candidate MIL
+
+Plain English:
+
+- Do not ask whole-slice Grad-CAM to find the nodule.
+- Instead, create candidate crops from the soft blob map.
+- Classify each crop.
+- Use the most suspicious crop as the whole-sample prediction.
+
+Formula:
+
+```text
+candidate_logits = model(candidate_crops)
+bag_logit = max(candidate_logits)
+loss = weighted_BCE(bag_logit, label)
+```
+
+Result:
+
+- overfit.
+- did not beat baseline.
+- idea was scrapped.
+
+
+# 12. Main Results Table
+
+| Experiment | Cache | Loss / Idea | AUC | Accuracy | F1 | Sensitivity | Specificity | Attention |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| Original baseline | `cache_hu_fixed.pkl` | BCE | 0.6719 | 0.6653 | 0.5281 | 0.5165 | 0.7500 | 24.5% lung |
+| Strict HU penalty | `cache_hu_fixed.pkl` | BCE + outside penalty | 0.6449 | 0.6653 | 0.4545 | 0.3846 | 0.8250 | 68.1% lung |
+| Zhang adaptive | `cache_hu_fixed.pkl` | BCE + Zhang margin | 0.6733 | 0.6614 | 0.4910 | 0.4505 | 0.7812 | 40.73% lung |
+| Improved Zhang | `cache_hu_fixed.pkl` | correct-class Zhang | 0.6740 | 0.6653 | 0.5333 | 0.5275 | 0.7438 | 40.87% lung |
+| Augmented baseline | `cache_hu_fixed.pkl` | BCE + augmentation | 0.7705 | 0.7371 | 0.6024 | 0.5495 | 0.8438 | 30.8% lung |
+| Augmented repeat | `cache_hu_fixed.pkl` | BCE + augmentation | 0.7543 | 0.7291 | 0.5584 | 0.4725 | 0.8750 | 30.1% lung |
+| 2.5D augmentation | `cache_hu_25d_2p5mm.pkl` | BCE + 3 slices + augmentation | 0.7480 | 0.6723 | 0.6244 | 0.6737 | 0.6714 | 33.5% lung |
+| Blob-only beta003 | `cache_hu_soft_blobs.pkl` | BCE + blob hinge | 0.6864 | 0.6255 | 0.5804 | 0.7143 | 0.5750 | blob 0.0681 |
+| Soft blob input | `cache_hu_soft_blobs.pkl` | CT + blob + lung input | 0.6386 | 0.5737 | 0.5286 | 0.6593 | 0.5250 | blob 0.0734 |
+| Candidate MIL | `cache_hu_soft_blobs.pkl` | candidate crop MIL | 0.6462 | 0.7171 | 0.5590 | 0.4945 | 0.8438 | candidate audit |
+| Spatial curriculum recovery | `cache_hu_fixed.pkl` | spatial + BCE curriculum | 0.5564 | 0.5618 | 0.4211 | 0.4396 | 0.6312 | 60.27% lung |
+
+Important comparison notes:
+
+- The 2.5D augmentation run used 235 test samples, not 251, so compare it
+  carefully.
+- Some exploratory runs were archived in `results/DONT NEED RESULTS`.
+- The most important main results are:
+  - original baseline.
+  - strict HU penalty.
+  - Zhang adaptive.
+  - improved Zhang.
+  - augmented baseline.
+  - augmented baseline repeat.
+  - 2.5D augmentation.
+  - blob-only beta003.
+
+
+## 12.1 Important Visual And Audit Files
+
+- These images are useful when explaining the project to a supervisor:
+
+| File | What It Shows | Why It Matters |
+|---|---|---|
+| `results/2026-06-06_run1/gradcam_examples_baseline.png` | baseline Grad-CAM examples | shows where the ordinary classifier looked |
+| `results/2026-06-06_run1/gradcam_examples.png` | strict HU Grad-CAM examples | shows the effect of the lung-mask penalty |
+| `results/2026-06-06_run1/nodule_gradcam_audit/annotation_vs_gradcam.png` | radiologist contour beside Grad-CAM | shows how Grad-CAM differs from the true annotated nodule region |
+| `results/2026-06-07_adaptive_search_zhang/adaptive_sensitivity.png` | Zhang alpha search plot | shows how Zhang/adaptive settings changed validation behavior |
+| `results/zhang_correct_conf_alpha1_20ep/adaptive_sensitivity.png` | improved Zhang alpha comparison | shows the correct-class confidence variant |
+| `results/auc_aug_baseline_50ep/gradcam_examples_baseline.png` | augmented baseline Grad-CAM | shows the best-AUC model's attention behavior |
+| `results/auc_aug_baseline_50ep_repeat_20260626/gradcam_examples_baseline.png` | augmented repeat Grad-CAM | checks whether augmentation behavior repeated |
+| `results/auc_aug_25d_2p5mm_50ep_20260626/gradcam_examples_baseline.png` | 2.5D augmented Grad-CAM | shows attention when neighbouring slices are used |
+| `results/soft_blob_annotation_preview.png` | soft blob maps with radiologist contour audit | shows whether annotation-free blob maps touch true nodules |
+| `results/soft_blob_full_dataset_audit/soft_blob_full_dataset_audit_summary.txt` | full-dataset soft blob audit summary | records quantitative blob-map coverage of contours |
+| `results/blob_only_beta003_20ep/gradcam_examples_soft_blob_test.png` | blob-only Grad-CAM examples | shows the direct blob-overlap loss behavior |
+| `results/candidate_mil_crop_preview_96.png` | 96-pixel candidate crop preview | shows why crop-based MIL was considered |
+
+- Important note:
+  - radiologist contours in these images are for audit and explanation only.
+  - they were not used to train annotation-free blob models.
+  - they help answer: "Did the model or soft blob map overlap the actual annotated nodule?"
+
+
+# 13. What Each Main Experiment Was Testing
+
+- Original baseline:
+  - establish ordinary ResNet classification performance.
+  - no attention guidance.
+
+- Strict HU Grad-CAM penalty:
+  - test if forcing attention inside lung improves interpretability.
+
+- Zhang/adaptive loss:
+  - test a softer attention rule.
+  - avoid forcing all attention mass inside the lung.
+
+- Improved Zhang:
+  - improve confidence weighting.
+  - avoid strongly guiding confidently wrong predictions.
+
+- Augmentation:
+  - improve AUC by making training data more varied.
+  - no attention loss.
+
+- 2.5D:
+  - test whether neighbouring slices improve classification.
+
+- Soft blob map:
+  - create annotation-free nodule-like map.
+  - audit whether it overlaps radiologist contours.
+
+- Blob-only Grad-CAM loss:
+  - test if Grad-CAM can be nudged toward nodule-like regions.
+
+- Soft blob input:
+  - test whether the soft blob map helps if fed directly to the model.
+
+- Candidate MIL:
+  - test candidate crop classification instead of whole-slice classification.
+
+- Spatial curriculum:
+  - test whether learning attention first and classification second improves both.
+
+
+# 14. Conclusions And Interpretation
+
+Best AUC:
+
+- augmented baseline.
+- AUC 0.7705.
+- repeat AUC 0.7543.
+
+Best AUC repeat:
+
+- augmented baseline repeat confirms augmentation effect is real.
+
+Best sensitivity/F1 balance:
+
+- 2.5D augmentation is promising.
+- AUC 0.7480.
+- F1 0.6244.
+- sensitivity 0.6737.
+
+Best attention-loss compromise:
+
+- improved Zhang.
+- AUC close to baseline.
+- attention much better than baseline.
+
+Strongest attention movement:
+
+- strict HU and spatial curriculum losses.
+- but these hurt AUC.
+
+Soft blob maps:
+
+- strong audit performance.
+- good at touching radiologist contours.
+- not yet reliable for improving AUC.
+
+Main lesson:
+
+- classification performance and attention alignment are not the same objective.
+- a model can look more medically reasonable but classify worse.
+- forcing Grad-CAM too strongly can damage the classifier.
+
+Practical conclusion:
+
+- use augmentation and possibly 2.5D for performance.
+- use improved Zhang for interpretability compromise.
+- present soft blob maps as an exploratory annotation-free prior.
+
+
+# 15. Limitations
+
+- LIDC labels are based on radiologist suspicion ratings.
+- They are not always pathology-confirmed cancer diagnoses.
+
+- The main 2D setup uses one selected slice.
+- This loses full 3D context.
+
+- HU lung masks are imperfect.
+- Some solid or boundary nodules may be partly outside the mask.
+
+- Grad-CAM is coarse.
+- It is not a segmentation mask.
+
+- Soft blob maps are not cancer labels.
+- They identify nodule-like or blob-like structures.
+
+- Attention can improve while AUC worsens.
+
+- Some experiments have different test sample counts.
+- 2.5D results should be compared carefully.
+
+- Many blob and spatial curriculum runs were exploratory.
+- They are archived in `results/DONT NEED RESULTS`.
+
+
+# 16. Final Plain-English Takeaway
+
+- The original baseline classified moderately well but often looked outside the
+  lung.
+
+- Strictly forcing Grad-CAM into the lung improved attention but reduced AUC.
+
+- Zhang-style adaptive attention gave a gentler compromise:
+  - better attention than baseline.
+  - AUC close to baseline.
+
+- Mild CT-safe augmentation gave the best classification AUC.
+
+- 2.5D augmentation is promising, especially for sensitivity and F1.
+
+- Soft blob maps successfully identify nodule-like regions without radiologist
+  annotations.
+
+- However, using soft blob maps in training has not yet beaten the augmented
+  baseline.
+
+- The clearest project conclusion is:
+  - improving interpretability and improving classification are related but
+    separate goals.
+  - attention guidance must be weak and carefully balanced.
