@@ -1,0 +1,7 @@
+{
+    "validation":  [
+                       {
+                           "image":  "LUNGX-CT001.nii.gz"
+                       }
+                   ]
+}

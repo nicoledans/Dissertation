@@ -147,11 +147,149 @@ from model import NoduleClassifier
 # so torch.enable_grad() explicitly enables autograd inside this function,
 # regardless of any outer torch.no_grad() context.
 # =============================================================================
-def _gradcam_mask_stats(model, val_nods, device):
+def _dataset_kwargs(args, include_prior_for_reward=False):
+    return {
+        "prior_mode": args.possible_prior_mode,
+        "prior_as_channel": args.prior_as_channel,
+        "return_prior": include_prior_for_reward,
+        "prior_runtime_dilation": getattr(args, "prior_runtime_dilation_iterations", 0),
+        "prior_runtime_blur_sigma": getattr(args, "prior_runtime_blur_sigma", 0.0),
+    }
+
+
+def _unpack_batch(batch):
+    if len(batch) == 4:
+        images, masks, priors, labels = batch
+    else:
+        images, masks, labels = batch
+        priors = None
+    return images, masks, priors, labels
+
+
+def _gradcam_mass(model, logits, labels, spatial_size):
+    scores = model.class_scores(logits, labels)
+    cam = model.differentiable_gradcam(scores, normalise=True)
+    cam = torch.nn.functional.interpolate(
+        cam.unsqueeze(1),
+        size=spatial_size,
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(1)
+    return cam / (cam.sum(dim=(1, 2), keepdim=True) + 1e-8)
+
+
+def _weighted_mean(loss_samples, sample_weight=None):
+    if sample_weight is None:
+        return loss_samples.mean()
+    weights = sample_weight.to(dtype=loss_samples.dtype, device=loss_samples.device)
+    return (loss_samples * weights).mean()
+
+
+def _overlap_threshold_loss(cam_mass, guide, target_overlap, sample_weight=None):
+    guide_2d = guide.squeeze(1).clamp(0.0, 1.0)
+    overlap = (cam_mass * guide_2d).sum(dim=(1, 2))
+    loss_samples = torch.relu(float(target_overlap) - overlap)
+    return _weighted_mean(loss_samples, sample_weight), overlap.detach()
+
+
+def _zhang_margin_loss(cam_mass, guide, delta, sample_weight=None):
+    guide_2d = guide.squeeze(1).clamp(0.0, 1.0)
+    outside_2d = 1.0 - guide_2d
+    inside_mean = (cam_mass * guide_2d).sum(dim=(1, 2)) / (
+        guide_2d.sum(dim=(1, 2)) + 1e-8
+    )
+    outside_mean = (cam_mass * outside_2d).sum(dim=(1, 2)) / (
+        outside_2d.sum(dim=(1, 2)) + 1e-8
+    )
+    margin = torch.relu(outside_mean - inside_mean + float(delta))
+    mass_overlap = (cam_mass * guide_2d).sum(dim=(1, 2))
+    return _weighted_mean(margin, sample_weight), mass_overlap.detach()
+
+
+def _attention_guide_loss(cam_mass, guide, target_or_delta, loss_type, sample_weight=None):
+    if loss_type == "overlap":
+        return _overlap_threshold_loss(cam_mass, guide, target_or_delta, sample_weight)
+    if loss_type == "zhang-margin":
+        return _zhang_margin_loss(cam_mass, guide, target_or_delta, sample_weight)
+    raise ValueError(f"Unsupported attention loss type: {loss_type}")
+
+
+def _attention_confidence(logits, mode):
+    if mode == "none":
+        return None
+    if mode == "distance":
+        return (2.0 * torch.abs(torch.sigmoid(logits.detach()) - 0.5)).clamp(0.0, 1.0)
+    raise ValueError(f"Unsupported attention confidence mode: {mode}")
+
+
+def _prior_overlap_loss(model, logits, labels, prior, target_overlap):
+    cam_mass = _gradcam_mass(model, logits, labels, prior.shape[-2:])
+    return _overlap_threshold_loss(cam_mass, prior, target_overlap)
+
+
+def _attention_schedule(args, epoch):
+    if args.attention_curriculum == "progressive-prior":
+        if epoch < args.prior_start_epoch:
+            prior_beta = 0.0
+            prior_target = 0.0
+        else:
+            denominator = max(args.epochs - args.prior_start_epoch, 1)
+            progress = min(max((epoch - args.prior_start_epoch) / denominator, 0.0), 1.0)
+            prior_beta = args.prior_overlap_beta
+            prior_target = (
+                args.prior_target_overlap
+                + progress * (args.prior_target_final - args.prior_target_overlap)
+            )
+        return {
+            "prior_beta": prior_beta,
+            "prior_target": prior_target,
+            "lung_beta": args.lung_overlap_beta,
+            "lung_target": args.lung_target_overlap,
+        }
+
+    if args.attention_curriculum == "none":
+        prior_beta = args.prior_overlap_beta if epoch >= args.prior_start_epoch else 0.0
+        return {
+            "prior_beta": prior_beta,
+            "prior_target": args.prior_target_overlap,
+            "lung_beta": args.lung_overlap_beta,
+            "lung_target": args.lung_target_overlap,
+        }
+
+    if epoch <= 5:
+        return {
+            "prior_beta": 0.0,
+            "prior_target": 0.0,
+            "lung_beta": 0.002 if args.lung_overlap_beta > 0 else 0.0,
+            "lung_target": 0.40,
+        }
+    if epoch <= 8:
+        return {
+            "prior_beta": 0.0,
+            "prior_target": 0.0,
+            "lung_beta": args.lung_overlap_beta,
+            "lung_target": 0.50,
+        }
+    if epoch <= 12:
+        return {
+            "prior_beta": min(args.prior_overlap_beta, 0.001),
+            "prior_target": 0.05,
+            "lung_beta": args.lung_overlap_beta,
+            "lung_target": args.lung_target_overlap,
+        }
+    return {
+        "prior_beta": args.prior_overlap_beta,
+        "prior_target": args.prior_target_overlap,
+        "lung_beta": args.lung_overlap_beta,
+        "lung_target": args.lung_target_overlap,
+    }
+
+
+def _gradcam_mask_stats(model, val_nods, device, args=None):
     """Compute % of Grad-CAM activation energy inside lung mask over full val set."""
     model.eval()
     pct_list = []
-    ds = LIDCDataset(val_nods)
+    ds = LIDCDataset(val_nods, **(_dataset_kwargs(args) if args is not None else {}))
     if len(ds) == 0:
         # Guard against an empty split (e.g. cache too small to produce a val set).
         # Returns (nan, nan, 0) so the caller can print "nan" rather than crashing
@@ -164,7 +302,8 @@ def _gradcam_mask_stats(model, val_nods, device):
     with torch.enable_grad():
         # enable_grad() ensures backward() can run even if this function is
         # called inside a torch.no_grad() outer context (e.g. from an eval block).
-        for images, masks, _ in loader:
+        for batch in loader:
+            images, masks, _priors, _ = _unpack_batch(batch)
             # Third element (labels) is unused — we only need images for the
             # forward pass and masks to compute the alignment percentage.
             images = images.to(device)
@@ -270,10 +409,10 @@ def _classification_metrics(labels, probs):
     }
 
 
-def _predict_probabilities(model, nods, device, batch_size, criterion=None, num_workers=0):
+def _predict_probabilities(model, nods, device, batch_size, criterion=None, num_workers=0, args=None):
     """Run inference and optionally return mean BCE loss for a split."""
     model.eval()
-    ds = LIDCDataset(nods)
+    ds = LIDCDataset(nods, **(_dataset_kwargs(args) if args is not None else {}))
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
@@ -282,7 +421,8 @@ def _predict_probabilities(model, nods, device, batch_size, criterion=None, num_
     total_loss = 0.0
     n_loss = 0
     with torch.no_grad():
-        for images, _masks, labels in loader:
+        for batch in loader:
+            images, _masks, _priors, labels = _unpack_batch(batch)
             images = images.to(device)
             labels_device = labels.to(device)
             logits = model(images).squeeze(1)
@@ -343,7 +483,7 @@ def _write_predictions_csv(path, nods, labels, probs):
 # Grad-CAM %  : mean % of activation inside the lung mask on the test set
 #               (same computation as validation, for completeness).
 # =============================================================================
-def _test_evaluate(model, test_nods, device, run_dir, batch_size, criterion=None, num_workers=0):
+def _test_evaluate(model, test_nods, device, run_dir, batch_size, criterion=None, num_workers=0, args=None):
     # test_nods  : list of sample dicts for the held-out test patients.
     # device     : "cuda" or "cpu" — must match where the model lives.
     # run_dir    : path to the current run's results directory; output is written here.
@@ -353,7 +493,7 @@ def _test_evaluate(model, test_nods, device, run_dir, batch_size, criterion=None
         return
 
     model.eval()
-    ds = LIDCDataset(test_nods)
+    ds = LIDCDataset(test_nods, **(_dataset_kwargs(args) if args is not None else {}))
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     # shuffle=False: evaluation order is irrelevant to metrics and keeping
     # it deterministic makes debugging easier.
@@ -364,7 +504,8 @@ def _test_evaluate(model, test_nods, device, run_dir, batch_size, criterion=None
     with torch.no_grad():
         # no_grad() disables the autograd engine entirely — no gradient graph
         # is built, halving memory usage and speeding up inference.
-        for images, _masks, labels in loader:
+        for batch in loader:
+            images, _masks, _priors, labels = _unpack_batch(batch)
             # _masks: underscore prefix signals intentional discard —
             # the baseline doesn't use masks for prediction.
             images = images.to(device)
@@ -422,7 +563,7 @@ def _test_evaluate(model, test_nods, device, run_dir, batch_size, criterion=None
     )
 
     print("\nComputing test Grad-CAM mask alignment...")
-    gcam_mean, gcam_std, gcam_n = _gradcam_mask_stats(model, test_nods, device)
+    gcam_mean, gcam_std, gcam_n = _gradcam_mask_stats(model, test_nods, device, args=args)
     # Runs the same mask-alignment computation on the test set for a complete
     # picture of alignment on held-out data, not just validation.
 
@@ -610,11 +751,121 @@ def train_baseline():
                         help="DataLoader workers. Keep 0 on Windows unless you know multiprocessing is stable.")
     parser.add_argument("--augment", action="store_true",
                         help="Apply conservative CT-safe augmentation to training samples only.")
+    parser.add_argument(
+        "--possible-prior-mode",
+        choices=["none", "binary", "blurred"],
+        default="none",
+        help="Use no possible-nodule prior, the binary candidate mask, or the blurred soft prior.",
+    )
+    parser.add_argument(
+        "--prior-as-channel",
+        action="store_true",
+        help="Append the selected possible-nodule prior as a 4th input channel.",
+    )
+    parser.add_argument(
+        "--prior-overlap-beta",
+        type=float,
+        default=0.0,
+        help="Weight for gentle Grad-CAM overlap reward with the selected possible-nodule prior.",
+    )
+    parser.add_argument(
+        "--prior-target-overlap",
+        type=float,
+        default=0.10,
+        help="Target Grad-CAM mass inside possible-nodule prior for overlap reward.",
+    )
+    parser.add_argument(
+        "--prior-start-epoch",
+        type=int,
+        default=1,
+        help="Epoch at which the possible-nodule prior overlap reward starts. Use >1 for staged training.",
+    )
+    parser.add_argument(
+        "--lung-overlap-beta",
+        type=float,
+        default=0.0,
+        help="Weight for gentle Grad-CAM overlap reward with the lung mask.",
+    )
+    parser.add_argument(
+        "--lung-target-overlap",
+        type=float,
+        default=0.60,
+        help="Target Grad-CAM mass inside lung mask for overlap reward.",
+    )
+    parser.add_argument(
+        "--attention-curriculum",
+        choices=["none", "ramped", "progressive-prior"],
+        default="none",
+        help="Use a staged/ramped lung and possible-nodule attention schedule.",
+    )
+    parser.add_argument(
+        "--prior-target-final",
+        type=float,
+        default=0.10,
+        help="Final prior target for --attention-curriculum progressive-prior.",
+    )
+    parser.add_argument(
+        "--attention-confidence-mode",
+        choices=["none", "distance"],
+        default="none",
+        help="Optionally weight attention losses by detached prediction confidence.",
+    )
+    parser.add_argument(
+        "--attention-loss-type",
+        choices=["overlap", "zhang-margin"],
+        default="overlap",
+        help=(
+            "Attention guide loss: overlap rewards minimum CAM mass in the guide; "
+            "zhang-margin enforces mean CAM inside guide > outside guide by the configured target/delta."
+        ),
+    )
+    parser.add_argument(
+        "--prior-attention-loss-type",
+        choices=["overlap", "zhang-margin"],
+        default=None,
+        help="Override attention loss type for possible-nodule prior only.",
+    )
+    parser.add_argument(
+        "--lung-attention-loss-type",
+        choices=["overlap", "zhang-margin"],
+        default=None,
+        help="Override attention loss type for lung mask only.",
+    )
+    parser.add_argument(
+        "--prior-runtime-dilation-iterations",
+        type=int,
+        default=0,
+        help="When using blurred prior reward, rebuild guide from binary candidate with this dilation.",
+    )
+    parser.add_argument(
+        "--prior-runtime-blur-sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian sigma after runtime candidate dilation for prior reward guide.",
+    )
     parser.add_argument("--spectral-decoupling-lambda", type=float, default=0.0,
                         help="Weight for spectral decoupling logit L2 penalty. 0 disables it.")
     parser.add_argument("--spectral-decoupling-gamma", type=float, default=0.0,
                         help="Target logit value for spectral decoupling penalty.")
     args = parser.parse_args()
+    if args.prior_as_channel and args.possible_prior_mode == "none":
+        parser.error("--prior-as-channel requires --possible-prior-mode binary or blurred")
+    if args.prior_overlap_beta > 0 and args.possible_prior_mode == "none":
+        parser.error("--prior-overlap-beta requires --possible-prior-mode binary or blurred")
+    if args.prior_overlap_beta < 0:
+        parser.error("--prior-overlap-beta must be non-negative")
+    if args.lung_overlap_beta < 0:
+        parser.error("--lung-overlap-beta must be non-negative")
+    if args.prior_runtime_dilation_iterations < 0:
+        parser.error("--prior-runtime-dilation-iterations must be non-negative")
+    if args.prior_start_epoch < 1:
+        parser.error("--prior-start-epoch must be 1 or greater")
+    if not 0 <= args.prior_target_overlap <= 1:
+        parser.error("--prior-target-overlap must be between 0 and 1")
+    if not 0 <= args.prior_target_final <= 1:
+        parser.error("--prior-target-final must be between 0 and 1")
+    if not 0 <= args.lung_target_overlap <= 1:
+        parser.error("--lung-target-overlap must be between 0 and 1")
 
     # ------------------------------------------------------------------
     # Run directory setup
@@ -676,8 +927,14 @@ def train_baseline():
     # ------------------------------------------------------------------
     # Datasets and DataLoaders
     # ------------------------------------------------------------------
-    train_ds = LIDCDataset(train_nods, augment=args.augment)
-    val_ds   = LIDCDataset(val_nods)
+    train_ds = LIDCDataset(
+        train_nods,
+        augment=args.augment,
+        prior_mode=args.possible_prior_mode,
+        prior_as_channel=args.prior_as_channel,
+        return_prior=args.prior_overlap_beta > 0,
+    )
+    val_ds = LIDCDataset(val_nods, **_dataset_kwargs(args))
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
@@ -694,7 +951,8 @@ def train_baseline():
     # Model, loss, and optimiser
     # ------------------------------------------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = NoduleClassifier().to(device)
+    input_channels = 4 if args.prior_as_channel else 3
+    model = NoduleClassifier(input_channels=input_channels).to(device)
     # Move all model parameters to the GPU (if available) so all forward
     # and backward passes run on the accelerator.
 
@@ -736,9 +994,39 @@ def train_baseline():
         f.write(f"Weight decay: {args.weight_decay}\n")
         f.write(f"Num workers: {args.num_workers}\n")
         f.write(f"Training augmentation: {args.augment}\n")
+        f.write(f"Possible nodule prior mode: {args.possible_prior_mode}\n")
+        f.write(f"Possible nodule prior as input channel: {args.prior_as_channel}\n")
+        f.write(f"Prior overlap beta: {args.prior_overlap_beta}\n")
+        f.write(f"Prior target overlap: {args.prior_target_overlap}\n")
+        f.write(f"Prior target final: {args.prior_target_final}\n")
+        f.write(f"Prior start epoch: {args.prior_start_epoch}\n")
+        f.write(f"Lung overlap beta: {args.lung_overlap_beta}\n")
+        f.write(f"Lung target overlap: {args.lung_target_overlap}\n")
+        f.write(f"Attention curriculum: {args.attention_curriculum}\n")
+        f.write(f"Attention loss type: {args.attention_loss_type}\n")
+        f.write(f"Prior attention loss type: {args.prior_attention_loss_type or args.attention_loss_type}\n")
+        f.write(f"Lung attention loss type: {args.lung_attention_loss_type or args.attention_loss_type}\n")
+        f.write(f"Attention confidence mode: {args.attention_confidence_mode}\n")
+        f.write(f"Prior runtime dilation iterations: {args.prior_runtime_dilation_iterations}\n")
+        f.write(f"Prior runtime blur sigma: {args.prior_runtime_blur_sigma}\n")
+        f.write(f"Input channels: {input_channels}\n")
         if args.augment:
             f.write("Augmentation details: training-only; validation/test unaugmented; unchanged p=0.25; hflip p=0.5; rotate +/-7 deg; translate +/-4%; scale 0.96-1.04; contrast 0.92-1.08; brightness +/-0.03; noise sigma 0.01 with p=0.25.\n")
-            f.write("Attention penalty: none; this is a weighted-BCE classification-only baseline.\n")
+        if args.prior_overlap_beta > 0 or args.lung_overlap_beta > 0:
+            if args.attention_loss_type == "overlap":
+                f.write("Attention prior: gentle correct-class Grad-CAM overlap reward.\n")
+            else:
+                f.write("Attention prior: Zhang-style correct-class Grad-CAM mean-inside-vs-outside margin.\n")
+            if args.lung_overlap_beta > 0:
+                f.write("  Lung guide: encourage Grad-CAM toward the lung mask.\n")
+            if args.prior_overlap_beta > 0:
+                f.write(f"  Possible-nodule guide: encourage Grad-CAM near the selected possible-nodule prior, starting at epoch {args.prior_start_epoch}.\n")
+            if args.attention_curriculum == "ramped":
+                f.write("  Ramped curriculum: epochs 1-5 lung target 0.40 beta 0.002; epochs 6-8 lung target 0.50; epochs 9-12 prior target 0.05 beta 0.001; epoch 13+ final configured targets/betas.\n")
+            if args.attention_curriculum == "progressive-prior":
+                f.write(f"  Progressive prior curriculum: lung guide active from epoch 1; prior guide starts at epoch {args.prior_start_epoch} and ramps target from {args.prior_target_overlap} to {args.prior_target_final} by the final epoch.\n")
+        else:
+            f.write("Attention prior: none.\n")
         f.write(f"Loss: BCEWithLogitsLoss(pos_weight={pos_weight.item():.6f})\n")
         f.write(f"Spectral decoupling lambda: {args.spectral_decoupling_lambda}\n")
         f.write(f"Spectral decoupling gamma: {args.spectral_decoupling_gamma}\n")
@@ -763,6 +1051,12 @@ def train_baseline():
             "train_bce",
             "train_sd_raw",
             "train_sd_weighted",
+            "train_prior_raw",
+            "train_prior_weighted",
+            "train_prior_overlap",
+            "train_lung_raw",
+            "train_lung_weighted",
+            "train_lung_overlap",
             "train_total_loss",
             "val_bce",
             "val_sd_raw",
@@ -775,6 +1069,11 @@ def train_baseline():
             "val_specificity_0p5",
         ])
         for epoch in range(1, args.epochs + 1):
+            attention = _attention_schedule(args, epoch)
+            active_prior_beta = attention["prior_beta"]
+            active_prior_target = attention["prior_target"]
+            active_lung_beta = attention["lung_beta"]
+            active_lung_target = attention["lung_target"]
 
             # ── Training phase ────────────────────────────────────────────
             model.train()
@@ -783,13 +1082,18 @@ def train_baseline():
             # using running statistics as in eval mode).
             train_bce_sum = 0.0
             train_sd_sum = 0.0
+            train_prior_sum = 0.0
+            train_prior_overlap_sum = 0.0
+            train_lung_sum = 0.0
+            train_lung_overlap_sum = 0.0
             train_total_sum = 0.0
             train_seen = 0
-            for batch_idx, (images, _masks, labels) in enumerate(train_loader):
-                # _masks: intentionally unused — baseline trains without any
-                # mask signal.  The leading underscore is a Python convention
-                # to indicate the variable is deliberately discarded.
+            for batch_idx, batch in enumerate(train_loader):
+                images, masks, priors, labels = _unpack_batch(batch)
+                # The lung mask is used only when an attention-overlap reward is
+                # enabled. Otherwise this remains classification-only training.
                 images = images.to(device)
+                masks = masks.to(device)
                 labels = labels.to(device)
 
                 optimizer.zero_grad()
@@ -798,8 +1102,8 @@ def train_baseline():
                 # batches, giving incorrect parameter updates.
 
                 logits = model(images).squeeze(1)
-                # Forward pass: (B, 3, H, W) -> (B,) after squeezing the
-                # output feature dimension.
+                # Forward pass: (B, C, H, W) -> (B,) after squeezing the
+                # output feature dimension. C is 3 normally, or 4 for prior-channel runs.
 
                 bce_loss = criterion(logits, labels)
                 # BCEWithLogitsLoss: compares per-sample logits to binary
@@ -809,10 +1113,47 @@ def train_baseline():
                 # it discourages early overconfidence without using masks,
                 # contours, Grad-CAM, or any extra labels.
                 weighted_sd = args.spectral_decoupling_lambda * sd_loss
-                total_loss = bce_loss + weighted_sd
+                if active_prior_beta > 0 or active_lung_beta > 0:
+                    cam_mass = _gradcam_mass(model, logits, labels, masks.shape[-2:])
+                    attention_weight = _attention_confidence(
+                        logits,
+                        args.attention_confidence_mode,
+                    )
+                else:
+                    cam_mass = None
+                    attention_weight = None
+                if active_prior_beta > 0:
+                    prior_loss, prior_overlap = _attention_guide_loss(
+                        cam_mass,
+                        priors.to(device),
+                        active_prior_target,
+                        args.prior_attention_loss_type or args.attention_loss_type,
+                        attention_weight,
+                    )
+                else:
+                    prior_loss = logits.new_tensor(0.0)
+                    prior_overlap = logits.detach().new_zeros(logits.shape)
+                if active_lung_beta > 0:
+                    lung_loss, lung_overlap = _attention_guide_loss(
+                        cam_mass,
+                        masks,
+                        active_lung_target,
+                        args.lung_attention_loss_type or args.attention_loss_type,
+                        attention_weight,
+                    )
+                else:
+                    lung_loss = logits.new_tensor(0.0)
+                    lung_overlap = logits.detach().new_zeros(logits.shape)
+                weighted_prior = active_prior_beta * prior_loss
+                weighted_lung = active_lung_beta * lung_loss
+                total_loss = bce_loss + weighted_sd + weighted_prior + weighted_lung
 
                 train_bce_sum += bce_loss.item() * images.size(0)
                 train_sd_sum += sd_loss.item() * images.size(0)
+                train_prior_sum += prior_loss.item() * images.size(0)
+                train_prior_overlap_sum += prior_overlap.mean().item() * images.size(0)
+                train_lung_sum += lung_loss.item() * images.size(0)
+                train_lung_overlap_sum += lung_overlap.mean().item() * images.size(0)
                 train_total_sum += total_loss.item() * images.size(0)
                 train_seen += images.size(0)
 
@@ -833,6 +1174,8 @@ def train_baseline():
                     f"Epoch {epoch:02d} | Batch {batch_idx:04d} | "
                     f"BCE {bce_loss.item():.4f} | "
                     f"SD {sd_loss.item():.4f} | "
+                    f"Prior {prior_loss.item():.4f} | "
+                    f"Lung {lung_loss.item():.4f} | "
                     f"Total {total_loss.item():.4f}"
                 )
                 # :02d/:04d: zero-padding so log lines sort correctly when
@@ -848,7 +1191,8 @@ def train_baseline():
             with torch.no_grad():
                 # no_grad() prevents building a gradient graph during
                 # validation, saving memory and speeding up inference.
-                for images, _masks, labels in val_loader:
+                for batch in val_loader:
+                    images, _masks, _priors, labels = _unpack_batch(batch)
                     images = images.to(device)
                     labels_device = labels.to(device)
                     logits = model(images).squeeze(1)
@@ -871,11 +1215,17 @@ def train_baseline():
             acc = sum(p == l for p, l in zip(preds_bin, all_labels)) / max(len(all_labels), 1)
             train_bce_mean = train_bce_sum / max(train_seen, 1)
             train_sd_mean = train_sd_sum / max(train_seen, 1)
+            train_prior_mean = train_prior_sum / max(train_seen, 1)
+            train_prior_overlap_mean = train_prior_overlap_sum / max(train_seen, 1)
+            train_lung_mean = train_lung_sum / max(train_seen, 1)
+            train_lung_overlap_mean = train_lung_overlap_sum / max(train_seen, 1)
             train_total_mean = train_total_sum / max(train_seen, 1)
             val_bce_mean = val_bce_sum / max(val_seen, 1)
             val_sd_mean = val_sd_sum / max(val_seen, 1)
             val_total_mean = val_total_sum / max(val_seen, 1)
             train_sd_weighted = args.spectral_decoupling_lambda * train_sd_mean
+            train_prior_weighted = active_prior_beta * train_prior_mean
+            train_lung_weighted = active_lung_beta * train_lung_mean
             val_sd_weighted = args.spectral_decoupling_lambda * val_sd_mean
             try:
                 auc = roc_auc_score(all_labels, all_preds)
@@ -889,7 +1239,10 @@ def train_baseline():
             val_metrics = _classification_metrics(all_labels, all_preds)
             log_line = (
                 f"Epoch {epoch:02d} | Train BCE {train_bce_mean:.4f} | "
-                f"Train SD {train_sd_weighted:.4f} | Train total {train_total_mean:.4f} | "
+                f"Train SD {train_sd_weighted:.4f} | "
+                f"Train prior {train_prior_weighted:.4f} | "
+                f"Train lung {train_lung_weighted:.4f} | "
+                f"Train total {train_total_mean:.4f} | "
                 f"Val BCE {val_bce_mean:.4f} | Val SD {val_sd_weighted:.4f} | "
                 f"Val total {val_total_mean:.4f} | Val AUC {auc:.4f} | "
                 f"Val Acc {acc:.4f} | Val F1 {val_metrics['f1']:.4f} | "
@@ -902,6 +1255,12 @@ def train_baseline():
                 f"{train_bce_mean:.8f}",
                 f"{train_sd_mean:.8f}",
                 f"{train_sd_weighted:.8f}",
+                f"{train_prior_mean:.8f}",
+                f"{train_prior_weighted:.8f}",
+                f"{train_prior_overlap_mean:.8f}",
+                f"{train_lung_mean:.8f}",
+                f"{train_lung_weighted:.8f}",
+                f"{train_lung_overlap_mean:.8f}",
                 f"{train_total_mean:.8f}",
                 f"{val_bce_mean:.8f}",
                 f"{val_sd_mean:.8f}",
@@ -952,6 +1311,7 @@ def train_baseline():
         args.batch_size,
         criterion=criterion,
         num_workers=args.num_workers,
+        args=args,
     )
     val_metrics = _classification_metrics(val_labels, val_probs)
     _write_predictions_csv(
@@ -975,7 +1335,7 @@ def train_baseline():
     # Grad-CAM mask alignment — validation set
     # ------------------------------------------------------------------
     print("\nComputing Grad-CAM mask alignment stats...")
-    mean_pct, std_pct, n_samples = _gradcam_mask_stats(model, val_nods, device)
+    mean_pct, std_pct, n_samples = _gradcam_mask_stats(model, val_nods, device, args=args)
     stats_lines = [
         "=== GRAD-CAM MASK ALIGNMENT (Baseline - no constraint) ===",
         f"Val samples evaluated: {n_samples}",
@@ -1020,7 +1380,9 @@ def train_baseline():
     # axes[collected] always returns a length-4 array of axes regardless of
     # how many rows there are.
 
-    for images, masks, labels in DataLoader(LIDCDataset(val_nods), batch_size=1):
+    viz_ds = LIDCDataset(val_nods, **_dataset_kwargs(args))
+    for batch in DataLoader(viz_ds, batch_size=1):
+        images, masks, _priors, labels = _unpack_batch(batch)
         # A fresh DataLoader with batch_size=1 iterates one sample at a time.
         # We stop after 4 examples via the break below.
         if collected >= 4:
@@ -1116,6 +1478,7 @@ def train_baseline():
         args.batch_size,
         criterion=criterion,
         num_workers=args.num_workers,
+        args=args,
     )
 
 

@@ -1,0 +1,30 @@
+Possible nodule prior cache
+Generated: 2026-07-11T02:00:27
+Input cache: .\cache\cache_ts_filled_dil1.pkl
+Output cache: .\cache\cache_ts_possible_nodule_prior_best.pkl
+Candidate TS cache: None
+Candidate TS masks replaced: 0/1559
+Contours used: no
+Samples: 1559
+Mean binary candidate area: 4.91%
+Mean soft prior value over image: 0.0597
+Prior mode: standard
+Dual HU dense: False
+Blur sigma: 3.0
+Prior dilation iterations before blur: 0
+Added TS border downweight: 1.0
+Component area scale: 50.0
+Solid bonus scale: 0.0
+Pleural dense blob enabled: False
+Pleural dense blob max area: 220
+Pleural dense blob max elongation: 2.5
+Pleural dense blob min contrast HU: 80.0
+Pleural dense blob core HU threshold: 0.0
+Pleural dense blob core dilation: 1
+Pleural dense blob keep large rim: False
+Pleural dense blob preserved after filter: False
+Boundary band used: False
+Max TS hole area: 100
+Restrict to TS or holes: False
+Exclude TS edge radius: 0
+Candidate lung erosion radius: 0

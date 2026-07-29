@@ -1,0 +1,26 @@
+{
+	"Modality": "CT",
+	"Manufacturer": "GE",
+	"ManufacturersModelName": "LightSpeed16",
+	"BodyPart": "CHEST",
+	"PatientPosition": "FFS",
+	"SoftwareVersions": "06MW03.5",
+	"ScanOptions": "HELICAL MODE",
+	"ImageType": ["ORIGINAL", "PRIMARY", "AXIAL"],
+	"DeidentificationMethod": ["DCM:113100/113105/113107/113108/113109/113111"],
+	"SeriesNumber": 3000523,
+	"ConvolutionKernel": "STANDARD",
+	"ExposureTime": 0.505,
+	"XRayTubeCurrent": 440,
+	"XRayExposure": 10,
+	"ImageOrientationPatientDICOM": [
+		1,
+		0,
+		0,
+		0,
+		1,
+		0	],
+	"BidsGuess": ["CT","CT"],
+	"ConversionSoftware": "dcm2niix",
+	"ConversionSoftwareVersion": "v1.0.20260416"
+}

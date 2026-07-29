@@ -68,6 +68,21 @@ def _overlay(image, mask, contour):
     return overlay
 
 
+def _missed_contour(mask, contour):
+    mask = mask.astype(bool)
+    contour = contour.astype(bool)
+    missed = contour & ~mask
+    image = np.zeros((*contour.shape, 3), dtype=np.float32)
+    image[contour, 0] = 0.25
+    image[contour, 1] = 0.25
+    image[contour, 2] = 0.25
+    image[mask, 2] = 0.45
+    image[missed, 0] = 1.0
+    image[missed, 1] = 0.1
+    image[missed, 2] = 0.1
+    return image
+
+
 def _audit(args):
     samples = _load_cache(args.cache_path)
     indexed = list(enumerate(samples))
@@ -215,7 +230,7 @@ def _write_outputs(rows, missing, total_samples, args):
 
 
 def _write_failure_grid(failures, out_dir):
-    cols = 3
+    cols = 5
     rows = len(failures)
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3.2))
     if rows == 1:
@@ -223,8 +238,10 @@ def _write_failure_grid(failures, out_dir):
     for row_index, row in enumerate(failures):
         panels = [
             ("CT", row["image"], "gray"),
+            ("Mask only", row["mask"], "gray"),
+            ("Nodule only", row["contour"], "gray"),
             ("Mask + nodule", _overlay(row["image"], row["mask"], row["contour"]), None),
-            ("Nodule contour", row["contour"], "gray"),
+            ("Missed nodule", _missed_contour(row["mask"], row["contour"]), None),
         ]
         for col_index, (title, image, cmap) in enumerate(panels):
             ax = axes[row_index, col_index]

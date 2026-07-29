@@ -16,6 +16,10 @@ cache/*_checkpoint.pkl
 
 # Virtual environment
 lidc_env/
+lidc_env_311/
+.venv/
+venv/
+env/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -35,3 +39,14 @@ Thumbs.db
 *.raw
 *.nii
 *.nii.gz
+*.pkl
+cache/Old Cache/cache_hu_soft_blobs_summary.csv
+cache/Old Cache/cache_hu_soft_blobs_info.txt
+cache/cache_hu_soft_blobs_summary.csv
+cache/cache_hu_soft_blobs_info.txt
+cache/cache_hu_soft_blobs_info.txt
+cache/cache_hu_soft_blobs_summary.csv
+cache/cache_hu_soft_blobs_summary.csv
+cache/cache_hu_soft_blobs_info.txt
+cache/cache_hu_soft_blobs_info.txt
+cache/cache_hu_soft_blobs_summary.csv

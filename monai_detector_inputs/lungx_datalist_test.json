@@ -1,0 +1,13 @@
+{
+  "validation": [
+    {
+      "image": "CT-TRAINING-BE001.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-BE002.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-BE006.nii.gz"
+    }
+  ]
+}

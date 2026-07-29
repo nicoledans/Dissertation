@@ -1,0 +1,214 @@
+{
+  "validation": [
+    {
+      "image": "CT-TRAINING-BE001.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-BE002.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-BE006.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-BE007.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-BE010.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-LC001.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-LC002.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-LC003.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-LC008.nii.gz"
+    },
+    {
+      "image": "CT-TRAINING-LC009.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT001.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT002.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT003.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT004.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT005.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT006.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT007.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT008.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT009.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT010.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT011.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT012.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT013.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT014.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT015.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT016.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT017.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT018.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT019.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT020.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT021.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT022.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT023.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT024.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT025.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT026.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT027.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT028.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT029.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT030.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT031.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT032.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT033.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT034.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT035.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT036.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT037.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT038.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT039.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT040.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT041.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT042.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT043.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT044.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT045.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT046.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT047.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT048.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT049.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT050.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT051.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT052.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT053.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT054.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT055.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT056.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT057.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT058.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT059.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT060.nii.gz"
+    }
+  ]
+}

@@ -25,10 +25,18 @@ def _load_cache(path):
     return samples
 
 
-def _load_failure_indices(path):
+def _load_failure_indices(path, min_coverage, max_coverage):
     with open(path, newline="") as file:
         rows = list(csv.DictReader(file))
-    return [int(row["cache_index"]) for row in rows]
+    indices = []
+    for row in rows:
+        coverage = float(row["coverage"])
+        if min_coverage is not None and coverage < min_coverage:
+            continue
+        if max_coverage is not None and coverage > max_coverage:
+            continue
+        indices.append(int(row["cache_index"]))
+    return indices
 
 
 def _candidate_lookup_for_patient(patient_id):
@@ -82,6 +90,21 @@ def _overlay(image, mask, contour):
     return overlay
 
 
+def _missed_contour(mask, contour):
+    mask = mask.astype(bool)
+    contour = contour.astype(bool)
+    missed = contour & ~mask
+    image = np.zeros((*contour.shape, 3), dtype=np.float32)
+    image[contour, 0] = 0.25
+    image[contour, 1] = 0.25
+    image[contour, 2] = 0.25
+    image[mask, 2] = 0.45
+    image[missed, 0] = 1.0
+    image[missed, 1] = 0.1
+    image[missed, 2] = 0.1
+    return image
+
+
 def _match_failures(samples, failure_indices, mask_key):
     wanted = [(index, samples[index]) for index in failure_indices]
     by_patient = defaultdict(list)
@@ -120,6 +143,8 @@ def _match_failures(samples, failure_indices, mask_key):
                     "label": int(sample["label"]),
                     "mean_rating": float(match.get("mean_rating", float("nan"))),
                     "coverage": coverage,
+                    "missed_pixels": total - overlap,
+                    "nodule_pixels": total,
                     "mask": mask,
                     "contour": contour,
                     "image": _image_for_display(sample),
@@ -135,7 +160,7 @@ def _write_pages(records, out_dir, per_page):
     for page in range(pages):
         chunk = records[page * per_page : (page + 1) * per_page]
         rows = len(chunk)
-        cols = 4
+        cols = 5
         fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.4, rows * 3.0))
         if rows == 1:
             axes = np.expand_dims(axes, axis=0)
@@ -143,9 +168,10 @@ def _write_pages(records, out_dir, per_page):
         for row_index, record in enumerate(chunk):
             panels = [
                 ("CT", record["image"], "gray"),
-                ("Mask", record["mask"], "gray"),
-                ("Cancer contour", record["contour"], "gray"),
+                ("Mask only", record["mask"], "gray"),
+                ("Nodule only", record["contour"], "gray"),
                 ("Overlay", _overlay(record["image"], record["mask"], record["contour"]), None),
+                ("Missed nodule", _missed_contour(record["mask"], record["contour"]), None),
             ]
             for col_index, (title, image, cmap) in enumerate(panels):
                 ax = axes[row_index, col_index]
@@ -159,7 +185,8 @@ def _write_pages(records, out_dir, per_page):
                         -0.08,
                         (
                             f"idx {record['cache_index']} {record['patient_id']} "
-                            f"slice {record['slice_idx']} cov {record['coverage']:.3f}"
+                            f"slice {record['slice_idx']} cov {record['coverage']:.3f}\n"
+                            f"missed {record['missed_pixels']} / {record['nodule_pixels']} px"
                         ),
                         transform=ax.transAxes,
                         fontsize=8,
@@ -167,12 +194,12 @@ def _write_pages(records, out_dir, per_page):
                     )
 
         fig.suptitle(
-            "HU Mask Failures: red=mask, yellow=cancer, cyan=missed cancer",
+            "Mask failures: overlay red=mask, yellow=nodule, cyan=missed; missed panel red=outside mask",
             fontsize=12,
             y=0.995,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.985))
-        filename = f"hu_mask_failures_page_{page + 1:02d}_of_{pages:02d}.png"
+        filename = f"mask_failures_page_{page + 1:02d}_of_{pages:02d}.png"
         fig.savefig(os.path.join(out_dir, filename), dpi=180)
         plt.close(fig)
 
@@ -190,13 +217,24 @@ def main():
     parser.add_argument("--mask-key", choices=["mask", "ts_mask"], default="mask")
     parser.add_argument("--out-dir", default="results/hu_mask_before_after/failures")
     parser.add_argument("--per-page", type=int, default=10)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--min-coverage", type=float, default=None)
+    parser.add_argument("--max-coverage", type=float, default=None)
     args = parser.parse_args()
 
     if args.per_page < 1:
         parser.error("--per-page must be at least 1")
+    if args.limit < 0:
+        parser.error("--limit must be non-negative")
 
     samples = _load_cache(args.cache_path)
-    failure_indices = _load_failure_indices(args.failures_csv)
+    failure_indices = _load_failure_indices(
+        args.failures_csv,
+        args.min_coverage,
+        args.max_coverage,
+    )
+    if args.limit:
+        failure_indices = failure_indices[: args.limit]
     records = _match_failures(samples, failure_indices, args.mask_key)
     _write_pages(records, args.out_dir, args.per_page)
     print(f"Exported {len(records)} failures to {args.out_dir}")

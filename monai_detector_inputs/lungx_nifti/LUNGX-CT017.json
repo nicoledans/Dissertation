@@ -1,0 +1,28 @@
+{
+	"Modality": "CT",
+	"Manufacturer": "Philips",
+	"ManufacturersModelName": "Brilliance 64",
+	"BodyPart": "LUNG",
+	"PatientPosition": "HFS",
+	"SoftwareVersions": "2.0.0",
+	"SeriesDescription": "HIGH RES",
+	"ProtocolName": "STANDARD CHEST PROTOCOL/Thorax",
+	"ScanOptions": "HELIX",
+	"ImageType": ["ORIGINAL", "PRIMARY", "AXIAL", "HELIX"],
+	"DeidentificationMethod": ["dcmfix 20100920-g81272519", "dcmfix 20100920-g81272519"],
+	"SeriesNumber": 6,
+	"AcquisitionTime": "19:27:5.000000",
+	"ConvolutionKernel": "D",
+	"XRayTubeCurrent": 462,
+	"XRayExposure": 250,
+	"ImageOrientationPatientDICOM": [
+		1,
+		0,
+		0,
+		0,
+		1,
+		0	],
+	"BidsGuess": ["CT","CT"],
+	"ConversionSoftware": "dcm2niix",
+	"ConversionSoftwareVersion": "v1.0.20260416"
+}

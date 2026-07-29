@@ -1,0 +1,13 @@
+LUNGx TotalSegmentator cache
+Generated: 2026-07-11T18:21:57
+Manifest root: C:\repo\manifest-cgqtDj7Y2699835271585651107
+Annotation sheet: .\data\lungx_annotations\TestSet_NoduleData_PublicRelease_wTruth.xlsx
+Output cache: .\cache\cache_lungx_ts_filled_dil1.pkl
+Device: gpu
+Scans requested: 60
+Scans processed: 60
+Samples cached: 73
+Samples with TS mask: 73/73
+ts_mask_original: TS full-volume lung mask, resized to 224
+ts_mask: ts_mask_original after fill_holes + closing radius 1 + dilation radius 1
+Failed scans: 0

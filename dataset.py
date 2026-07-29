@@ -3,6 +3,7 @@ import pickle
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 from torch.utils.data import Dataset
@@ -42,26 +43,83 @@ def _map_to_tensor(map_2d, size=IMG_SIZE):
     return m.clamp(0.0, 1.0).float()
 
 
-def _augment_image_and_mask(image, mask):
+def _dilate_binary_tensor(mask, iterations):
+    output = mask
+    for _ in range(max(int(iterations), 0)):
+        output = F.max_pool2d(output.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
+    return (output > 0.5).float()
+
+
+def _blur_tensor_map(mask, sigma):
+    sigma = float(sigma)
+    if sigma <= 0:
+        return mask.clamp(0.0, 1.0)
+    kernel_size = int(max(3, round(sigma * 6) // 2 * 2 + 1))
+    blurred = TF.gaussian_blur(mask, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
+    peak = blurred.max()
+    if float(peak) > 0:
+        blurred = blurred / (peak + 1e-8)
+    return blurred.clamp(0.0, 1.0)
+
+
+def _augment_image_and_mask(
+    image,
+    mask,
+    prior=None,
+    prior_is_binary=False,
+    strength="standard",
+):
     """Apply conservative CT-safe training augmentation.
 
     The geometry is shared between image and mask so attention experiments can
     still use the returned mask correctly. Intensity jitter is deliberately
     small and grayscale-only because CT values carry physical meaning.
     """
-    if torch.rand(()) < 0.25:
-        return image, mask
+    if strength == "standard":
+        unchanged_p = 0.25
+        rotation = 7.0
+        translate_frac = 0.04
+        scale_min, scale_max = 0.96, 1.04
+        contrast_min, contrast_max = 0.92, 1.08
+        brightness_abs = 0.03
+        noise_sigma = 0.01
+        noise_p = 0.25
+    elif strength == "medium":
+        unchanged_p = 0.20
+        rotation = 10.0
+        translate_frac = 0.05
+        scale_min, scale_max = 0.94, 1.06
+        contrast_min, contrast_max = 0.90, 1.10
+        brightness_abs = 0.035
+        noise_sigma = 0.012
+        noise_p = 0.30
+    elif strength == "strong":
+        unchanged_p = 0.15
+        rotation = 12.0
+        translate_frac = 0.06
+        scale_min, scale_max = 0.92, 1.08
+        contrast_min, contrast_max = 0.88, 1.12
+        brightness_abs = 0.04
+        noise_sigma = 0.015
+        noise_p = 0.35
+    else:
+        raise ValueError(f"Unknown augmentation strength: {strength}")
+
+    if torch.rand(()) < unchanged_p:
+        return image, mask, prior
 
     if torch.rand(()) < 0.5:
         image = TF.hflip(image)
         mask = TF.hflip(mask)
+        if prior is not None:
+            prior = TF.hflip(prior)
 
-    angle = float(torch.empty(()).uniform_(-7.0, 7.0).item())
+    angle = float(torch.empty(()).uniform_(-rotation, rotation).item())
     translate = [
-        int(torch.empty(()).uniform_(-0.04, 0.04).item() * IMG_SIZE),
-        int(torch.empty(()).uniform_(-0.04, 0.04).item() * IMG_SIZE),
+        int(torch.empty(()).uniform_(-translate_frac, translate_frac).item() * IMG_SIZE),
+        int(torch.empty(()).uniform_(-translate_frac, translate_frac).item() * IMG_SIZE),
     ]
-    scale = float(torch.empty(()).uniform_(0.96, 1.04).item())
+    scale = float(torch.empty(()).uniform_(scale_min, scale_max).item())
     image = TF.affine(
         image,
         angle=angle,
@@ -80,15 +138,33 @@ def _augment_image_and_mask(image, mask):
         interpolation=InterpolationMode.NEAREST,
         fill=0.0,
     )
+    if prior is not None:
+        prior = TF.affine(
+            prior,
+            angle=angle,
+            translate=translate,
+            scale=scale,
+            shear=[0.0, 0.0],
+            interpolation=(
+                InterpolationMode.NEAREST
+                if prior_is_binary
+                else InterpolationMode.BILINEAR
+            ),
+            fill=0.0,
+        )
 
-    contrast = float(torch.empty(()).uniform_(0.92, 1.08).item())
-    brightness = float(torch.empty(()).uniform_(-0.03, 0.03).item())
+    contrast = float(torch.empty(()).uniform_(contrast_min, contrast_max).item())
+    brightness = float(torch.empty(()).uniform_(-brightness_abs, brightness_abs).item())
     image = (image - 0.5) * contrast + 0.5 + brightness
 
-    if torch.rand(()) < 0.25:
-        image = image + torch.randn_like(image) * 0.01
+    if torch.rand(()) < noise_p:
+        image = image + torch.randn_like(image) * noise_sigma
 
-    return image.clamp(0.0, 1.0), (mask > 0.5).float()
+    image = image.clamp(0.0, 1.0)
+    mask = (mask > 0.5).float()
+    if prior is not None:
+        prior = (prior > 0.5).float() if prior_is_binary else prior.clamp(0.0, 1.0)
+    return image, mask, prior
 
 
 def _load_cache(cache_path):
@@ -177,6 +253,8 @@ def load_nodules_hu(cache_path=None):
             "subsolid_like_map",
             "vesselness_map",
             "search_mask",
+            "possible_nodule_mask",
+            "possible_nodule_prior",
         ):
             if key in s:
                 item[key] = s[key]
@@ -201,6 +279,10 @@ def _copy_optional_maps(source, target):
         "search_mask",
         "soft_blob_method",
         "soft_blob_params",
+        "possible_nodule_mask",
+        "possible_nodule_prior",
+        "possible_nodule_prior_method",
+        "possible_nodule_prior_params",
     ):
         if key in source:
             target[key] = source[key]
@@ -263,10 +345,32 @@ def patient_split(nodules, seed=SEED):
 
 
 class LIDCDataset(Dataset):
-    def __init__(self, nodule_list, augment=False):
+    def __init__(
+        self,
+        nodule_list,
+        augment=False,
+        prior_mode="none",
+        prior_as_channel=False,
+        return_prior=False,
+        prior_runtime_dilation=0,
+        prior_runtime_blur_sigma=0.0,
+        augment_strength="standard",
+    ):
         self.nodules = nodule_list
         self.labels = [n["label"] for n in nodule_list]
         self.augment = augment
+        self.prior_mode = prior_mode
+        self.prior_as_channel = prior_as_channel
+        self.return_prior = return_prior
+        self.prior_runtime_dilation = int(prior_runtime_dilation)
+        self.prior_runtime_blur_sigma = float(prior_runtime_blur_sigma)
+        self.augment_strength = augment_strength
+        if prior_mode not in ("none", "binary", "blurred"):
+            raise ValueError(f"Unknown prior_mode: {prior_mode}")
+        if prior_as_channel and prior_mode == "none":
+            raise ValueError("prior_as_channel requires prior_mode binary or blurred")
+        if return_prior and prior_mode == "none":
+            raise ValueError("return_prior requires prior_mode binary or blurred")
 
     def __len__(self):
         return len(self.nodules)
@@ -275,9 +379,29 @@ class LIDCDataset(Dataset):
         item = self.nodules[idx]
         image = _patch_to_tensor(item["patch"])           # (3, 224, 224)
         mask = _mask_to_tensor(item["mask"])              # (1, 224, 224)
+        prior = None
+        if self.prior_mode == "binary":
+            prior = _mask_to_tensor(item["possible_nodule_mask"])
+        elif self.prior_mode == "blurred":
+            if self.prior_runtime_dilation > 0:
+                prior = _mask_to_tensor(item["possible_nodule_mask"])
+                prior = _dilate_binary_tensor(prior, self.prior_runtime_dilation)
+                prior = _blur_tensor_map(prior, self.prior_runtime_blur_sigma)
+            else:
+                prior = _map_to_tensor(item["possible_nodule_prior"])
         if self.augment:
-            image, mask = _augment_image_and_mask(image, mask)
+            image, mask, prior = _augment_image_and_mask(
+                image,
+                mask,
+                prior,
+                prior_is_binary=self.prior_mode == "binary",
+                strength=self.augment_strength,
+            )
+        if self.prior_as_channel:
+            image = torch.cat([image, prior], dim=0)
         label_t = torch.tensor(item["label"], dtype=torch.float32)
+        if self.return_prior:
+            return image, mask, prior, label_t
         return image, mask, label_t
 
     def class_weights(self):

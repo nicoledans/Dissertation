@@ -1,0 +1,12 @@
+TotalSegmentator mask post-process
+Generated: 2026-06-29T21:40:04
+Input cache: .\cache\cache_ts.pkl
+Output cache: .\cache\cache_ts_filled_dil1.pkl
+Mask key: ts_mask
+Samples: 1559
+Missing masks: 0
+Changed masks: 1559
+Closing radius: 1
+Dilation radius: 1
+Total pixels added: 1024482
+Total pixels removed: 0

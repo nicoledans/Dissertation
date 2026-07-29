@@ -21,7 +21,7 @@ class NoduleClassifier(nn.Module):
     the normal forward prediction.
     """
 
-    def __init__(self):
+    def __init__(self, input_channels=3):
         super().__init__()
 
         # ResNet-50 is a deep convolutional neural network. Convolutions scan
@@ -34,6 +34,26 @@ class NoduleClassifier(nn.Module):
         # but pretrained edge and texture detectors are usually a better starting
         # point than completely random filters, especially for a small dataset.
         backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        if input_channels != 3:
+            old_conv = backbone.conv1
+            new_conv = nn.Conv2d(
+                input_channels,
+                old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=old_conv.bias is not None,
+            )
+            with torch.no_grad():
+                new_conv.weight[:, :3] = old_conv.weight
+                for channel in range(3, input_channels):
+                    new_conv.weight[:, channel:channel + 1] = old_conv.weight.mean(
+                        dim=1,
+                        keepdim=True,
+                    )
+                if old_conv.bias is not None:
+                    new_conv.bias.copy_(old_conv.bias)
+            backbone.conv1 = new_conv
 
         # Standard ResNet-50 ends with a layer that predicts 1,000 ImageNet
         # object classes. We replace that layer because this project needs one

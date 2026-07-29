@@ -1,0 +1,34 @@
+{
+  "validation": [
+    {
+      "image": "LUNGX-CT001.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT002.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT003.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT004.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT005.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT006.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT007.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT008.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT009.nii.gz"
+    },
+    {
+      "image": "LUNGX-CT010.nii.gz"
+    }
+  ]
+}
